@@ -65,6 +65,7 @@ struct Output {
     status: String,
     fps: f64,
     night: bool,
+    system_off: bool,
 }
 impl Default for Output {
     fn default() -> Self {
@@ -75,6 +76,7 @@ impl Default for Output {
             status: "Starting…".into(),
             fps: 0.0,
             night: false,
+            system_off: false,
         }
     }
 }
@@ -97,6 +99,8 @@ struct Dashboard {
     quit: bool,
     #[cfg(windows)]
     tray: Option<Tray>,
+    #[cfg(windows)]
+    _display_power: Option<crate::power::DisplayPower>,
 }
 
 pub fn run(args: Args, settings: Settings) -> Result<()> {
@@ -149,6 +153,14 @@ impl Dashboard {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let output = Arc::new(Mutex::new(Output::default()));
         let shared_settings = Arc::new(Mutex::new(settings.clone()));
+        let system_off = Arc::new(AtomicBool::new(false));
+        #[cfg(windows)]
+        let (display_power, power_error) = match NativeWindow::from_context(cc)
+            .and_then(|window| crate::power::DisplayPower::new(window.0 as _, system_off.clone()))
+        {
+            Ok(monitor) => (Some(monitor), String::new()),
+            Err(e) => (None, format!("Display power sync unavailable: {e:#}")),
+        };
         let home = args.agent_home.clone().unwrap_or_else(|| {
             directories::UserDirs::new()
                 .map(|d| d.home_dir().to_path_buf())
@@ -208,11 +220,13 @@ impl Dashboard {
                     let settings = shared_settings.lock().unwrap().clone();
                     let snapshot = snapshot.lock().unwrap().clone();
                     let night = settings.is_night();
+                    let off = settings.follow_system_display && system_off.load(Ordering::Relaxed);
+                    let blank = night || off;
                     let frame =
                         renderer.render(&snapshot, &settings, start.elapsed().as_secs_f64());
                     if let Some(device) = &mut lcd {
                         let black;
-                        let send_frame = if night {
+                        let send_frame = if blank {
                             black = image::RgbaImage::from_pixel(
                                 1920,
                                 480,
@@ -236,6 +250,7 @@ impl Dashboard {
                         state.frame = Some(frame);
                         state.sequence += 1;
                         state.night = night;
+                        state.system_off = off;
                         if fps_start.elapsed() >= Duration::from_secs(1) {
                             state.fps = frames as f64 / fps_start.elapsed().as_secs_f64();
                             frames = 0;
@@ -243,14 +258,23 @@ impl Dashboard {
                         }
                     }
                     ctx.request_repaint();
-                    let interval = if night {
+                    let interval = if blank {
                         Duration::from_secs(3)
                     } else if snapshot.animated() {
                         Duration::from_secs_f64(1.0 / 15.0)
                     } else {
                         Duration::from_millis(500)
                     };
-                    interruptible_sleep(&stop, interval.saturating_sub(tick.elapsed()));
+                    interruptible_sleep_while(
+                        &stop,
+                        interval.saturating_sub(tick.elapsed()),
+                        || {
+                            shared_settings.lock().unwrap().follow_system_display
+                                == settings.follow_system_display
+                                && (!settings.follow_system_display
+                                    || system_off.load(Ordering::Relaxed) == off)
+                        },
+                    );
                 }
             })
         };
@@ -269,7 +293,11 @@ impl Dashboard {
             texture: None,
             sequence: 0,
             #[cfg(windows)]
-            error: tray_error,
+            error: [tray_error, power_error]
+                .into_iter()
+                .filter(|error| !error.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
             #[cfg(not(windows))]
             error: String::new(),
             show_settings: false,
@@ -281,6 +309,8 @@ impl Dashboard {
             quit: false,
             #[cfg(windows)]
             tray,
+            #[cfg(windows)]
+            _display_power: display_power,
         }
     }
     fn visible(&mut self, ctx: &egui::Context, visible: bool) {
@@ -332,6 +362,15 @@ impl Dashboard {
                 changed |= ui
                     .checkbox(&mut self.settings.rotate, "LCD 旋转 180°")
                     .changed();
+                #[cfg(windows)]
+                {
+                    changed |= ui
+                        .checkbox(
+                            &mut self.settings.follow_system_display,
+                            "跟随系统熄屏/亮屏",
+                        )
+                        .changed();
+                }
                 changed |= ui
                     .checkbox(
                         &mut self.settings.night_enabled,
@@ -390,13 +429,14 @@ impl eframe::App for Dashboard {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.visible(ctx, false);
         }
-        let (connected, status, fps, night, sequence, frame) = {
+        let (connected, status, fps, night, system_off, sequence, frame) = {
             let output = self.output.lock().unwrap();
             (
                 output.connected,
                 output.status.clone(),
                 output.fps,
                 output.night,
+                output.system_off,
                 output.sequence,
                 if output.sequence != self.sequence {
                     output.frame.clone()
@@ -440,7 +480,13 @@ impl eframe::App for Dashboard {
                 }
                 ui.label(format!(
                     "{fps:.1} fps{}",
-                    if night { " · 夜间熄屏" } else { "" }
+                    if system_off {
+                        " · 跟随系统熄屏"
+                    } else if night {
+                        " · 夜间熄屏"
+                    } else {
+                        ""
+                    }
                 ));
             });
         });
@@ -474,8 +520,15 @@ impl Drop for Dashboard {
     }
 }
 fn interruptible_sleep(stop: &AtomicBool, duration: Duration) {
+    interruptible_sleep_while(stop, duration, || true);
+}
+fn interruptible_sleep_while(
+    stop: &AtomicBool,
+    duration: Duration,
+    keep_sleeping: impl Fn() -> bool,
+) {
     let deadline = Instant::now() + duration;
-    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+    while !stop.load(Ordering::Relaxed) && keep_sleeping() && Instant::now() < deadline {
         thread::sleep(
             Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
         );
@@ -646,4 +699,32 @@ fn set_autostart(enabled: bool) -> Result<()> {
         return Err(e.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_power_changes_interrupt_the_frame_interval() {
+        for initially_off in [false, true] {
+            let off = Arc::new(AtomicBool::new(initially_off));
+            let worker_off = off.clone();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                started_tx.send(()).unwrap();
+                interruptible_sleep_while(&stop, Duration::from_secs(3), || {
+                    worker_off.load(Ordering::Relaxed) == initially_off
+                });
+                finished_tx.send(()).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            off.store(!initially_off, Ordering::Relaxed);
+            let result = finished_rx.recv_timeout(Duration::from_millis(500));
+            worker.join().unwrap();
+            result.expect("LCD should respond without waiting for the three-second black interval");
+        }
+    }
 }

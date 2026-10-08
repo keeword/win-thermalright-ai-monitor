@@ -4,6 +4,8 @@ mod agents;
 mod app;
 mod config;
 mod metrics;
+#[cfg(windows)]
+mod power;
 mod protocol;
 mod render;
 mod usb;

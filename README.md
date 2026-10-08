@@ -75,6 +75,8 @@ Windows 不直接提供 macOS 的 Active/Wired/Compressed、P/E 核标签及 loa
 
 渲染与 USB 在后台线程执行，指标独立采集。活动动画时目标约 15 fps，空闲 2 fps；实际帧率受 CPU/JPEG 编码和 USB 限制。设置可启用跨午夜的夜间熄屏（默认关闭，预设 18:30–09:00），夜间 LCD 输出黑帧，本机继续预览。
 
+设置中的「跟随系统熄屏/亮屏」默认启用，可随时关闭。启用后 LCD 跟随 Windows 显示器电源状态：系统熄屏时输出黑帧，系统亮屏时恢复实时画面，隐藏到托盘后仍然生效。系统仅调暗屏幕时保持显示；如果仍处于启用的夜间熄屏时段，则继续保持黑屏。这里的熄屏与夜间模式相同，使用黑帧，不关闭 LCD 背光或切断 USB 电源。
+
 ## 日志和设置
 
 默认读取当前用户目录，可用 `--agent-home E:\some-home` 改成另一个日志根目录：
@@ -99,6 +101,7 @@ Windows 不直接提供 macOS 的 Active/Wired/Compressed、P/E 核标签及 loa
   "right": "Codex",
   "brightness": 1,
   "rotate": true,
+  "follow_system_display": true,
   "night_enabled": false,
   "night_start": 1110,
   "night_end": 540,

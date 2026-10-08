@@ -11,6 +11,7 @@ pub struct Settings {
     pub right: AgentKind,
     pub brightness: u8,
     pub rotate: bool,
+    pub follow_system_display: bool,
     pub night_enabled: bool,
     pub night_start: u16,
     pub night_end: u16,
@@ -24,6 +25,7 @@ impl Default for Settings {
             right: AgentKind::Codex,
             brightness: 1,
             rotate: true,
+            follow_system_display: true,
             night_enabled: false,
             night_start: 1110,
             night_end: 540,
@@ -90,4 +92,18 @@ fn night_window_crosses_midnight() {
     assert!(!in_window(540, 1110, 540));
     assert!(!in_window(720, 1110, 540));
     assert!(!in_window(720, 720, 720));
+}
+
+#[test]
+fn system_display_sync_defaults_on_and_persists_opt_out() {
+    let old_config: Settings = serde_json::from_str(r#"{"brightness": 2}"#).unwrap();
+    assert!(old_config.follow_system_display);
+    let settings = Settings {
+        follow_system_display: false,
+        ..Default::default()
+    };
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("settings.json");
+    settings.save(&path).unwrap();
+    assert!(!Settings::load(Some(&path)).unwrap().follow_system_display);
 }
