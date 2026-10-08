@@ -3,7 +3,9 @@ use crate::{
     agents::AgentKind,
     config::Settings,
     metrics::{Metrics, Snapshot},
+    monitor::Monitor,
     render::Renderer,
+    session::{AgentSnapshot, OpenState, ViewMode, ViewState},
     usb::Lcd,
 };
 use anyhow::{Context, Result};
@@ -66,6 +68,7 @@ struct Output {
     fps: f64,
     night: bool,
     system_off: bool,
+    view: ViewState,
 }
 impl Default for Output {
     fn default() -> Self {
@@ -77,6 +80,7 @@ impl Default for Output {
             fps: 0.0,
             night: false,
             system_off: false,
+            view: ViewState::default(),
         }
     }
 }
@@ -84,6 +88,10 @@ struct Dashboard {
     settings: Settings,
     settings_path: PathBuf,
     shared_settings: Arc<Mutex<Settings>>,
+    agents: Arc<Mutex<AgentSnapshot>>,
+    view: Arc<Mutex<ViewState>>,
+    frame_view: ViewState,
+    show_sessions: bool,
     output: Arc<Mutex<Output>>,
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
@@ -153,6 +161,8 @@ impl Dashboard {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let output = Arc::new(Mutex::new(Output::default()));
         let shared_settings = Arc::new(Mutex::new(settings.clone()));
+        let agents = Arc::new(Mutex::new(AgentSnapshot::default()));
+        let view = Arc::new(Mutex::new(ViewState::default()));
         let system_off = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]
         let (display_power, power_error) = match NativeWindow::from_context(cc)
@@ -166,11 +176,31 @@ impl Dashboard {
                 .map(|d| d.home_dir().to_path_buf())
                 .unwrap_or_default()
         });
+        let agent_worker = if args.demo {
+            None
+        } else {
+            let agents = agents.clone();
+            let stop = stop.clone();
+            let shared_settings = shared_settings.clone();
+            let home = home.clone();
+            Some(thread::spawn(move || {
+                let mut monitor =
+                    Monitor::new(home, shared_settings.lock().unwrap().agents.clone());
+                while !stop.load(Ordering::Relaxed) {
+                    monitor.settings(shared_settings.lock().unwrap().agents.clone());
+                    let value = monitor.tick(&stop);
+                    *agents.lock().unwrap() = value;
+                    interruptible_sleep(&stop, Duration::from_millis(100));
+                }
+            }))
+        };
         let metric_worker = {
             let stop = stop.clone();
             let snapshot = snapshot.clone();
+            let agents = agents.clone();
             let demo = args.demo;
             let cores = args.cores;
+            let demo_sessions = args.demo_sessions as usize;
             thread::spawn(move || {
                 let mut metrics = if demo { None } else { Some(Metrics::new(home)) };
                 let start = Instant::now();
@@ -178,8 +208,11 @@ impl Dashboard {
                     let value = if let Some(metrics) = &mut metrics {
                         metrics.collect()
                     } else {
-                        Snapshot::demo(start.elapsed().as_secs_f64(), cores)
+                        Snapshot::demo_count(start.elapsed().as_secs_f64(), cores, demo_sessions)
                     };
+                    if demo {
+                        *agents.lock().unwrap() = value.agents.clone();
+                    }
                     *snapshot.lock().unwrap() = value;
                     interruptible_sleep(&stop, Duration::from_millis(500));
                 }
@@ -190,6 +223,8 @@ impl Dashboard {
             let output = output.clone();
             let shared_settings = shared_settings.clone();
             let ctx = ctx.clone();
+            let agents = agents.clone();
+            let view = view.clone();
             thread::spawn(move || {
                 let mut lcd: Option<Lcd> = None;
                 let mut retry = Instant::now();
@@ -218,12 +253,22 @@ impl Dashboard {
                         retry = tick + Duration::from_secs(3);
                     }
                     let settings = shared_settings.lock().unwrap().clone();
-                    let snapshot = snapshot.lock().unwrap().clone();
+                    let mut snapshot = snapshot.lock().unwrap().clone();
+                    snapshot.agents = agents.lock().unwrap().clone();
                     let night = settings.is_night();
+
                     let off = settings.follow_system_display && system_off.load(Ordering::Relaxed);
                     let blank = night || off;
-                    let frame =
-                        renderer.render(&snapshot, &settings, start.elapsed().as_secs_f64());
+                    let current_view = {
+                        let mut view = view.lock().unwrap();
+                        view.sync(&snapshot.agents, &settings.agent_view, tick, blank);
+                        view.clone()
+                    };
+                    let frame = renderer.render_view(
+                        &snapshot,
+                        &current_view,
+                        start.elapsed().as_secs_f64(),
+                    );
                     if let Some(device) = &mut lcd {
                         let black;
                         let send_frame = if blank {
@@ -248,6 +293,7 @@ impl Dashboard {
                     {
                         let mut state = output.lock().unwrap();
                         state.frame = Some(frame);
+                        state.view = current_view;
                         state.sequence += 1;
                         state.night = night;
                         state.system_off = off;
@@ -287,9 +333,16 @@ impl Dashboard {
             settings,
             settings_path: args.config.unwrap_or_else(Settings::path),
             shared_settings,
+            agents,
+            view,
+            frame_view: ViewState::default(),
+            show_sessions: false,
             output,
             stop,
-            workers: vec![metric_worker, display_worker],
+            workers: [Some(metric_worker), Some(display_worker), agent_worker]
+                .into_iter()
+                .flatten()
+                .collect(),
             texture: None,
             sequence: 0,
             #[cfg(windows)]
@@ -343,19 +396,24 @@ impl Dashboard {
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
-                for (label, selected) in [
-                    ("左侧 Agent", &mut self.settings.left),
-                    ("右侧 Agent", &mut self.settings.right),
-                ] {
-                    egui::ComboBox::from_label(label)
-                        .selected_text(selected.name())
-                        .show_ui(ui, |ui| {
-                            for kind in AgentKind::ALL {
-                                changed |=
-                                    ui.selectable_value(selected, kind, kind.name()).changed();
-                            }
-                        });
-                }
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.agents.windows_enabled,
+                        "采集 Windows 当前用户",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.agents.wsl_running_enabled,
+                        "发现运行中的 WSL2",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.agents.wsl_default_user,
+                        "采集 WSL 默认用户",
+                    )
+                    .changed();
                 changed |= ui
                     .add(egui::Slider::new(&mut self.settings.brightness, 1..=10).text("亮度"))
                     .changed();
@@ -429,7 +487,7 @@ impl eframe::App for Dashboard {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.visible(ctx, false);
         }
-        let (connected, status, fps, night, system_off, sequence, frame) = {
+        let (connected, status, fps, night, system_off, sequence, frame, frame_view) = {
             let output = self.output.lock().unwrap();
             (
                 output.connected,
@@ -443,9 +501,11 @@ impl eframe::App for Dashboard {
                 } else {
                     None
                 },
+                output.view.clone(),
             )
         };
         if let Some(frame) = frame {
+            self.frame_view = frame_view;
             let pixels = egui::ColorImage::from_rgba_unmultiplied([1920, 480], frame.as_raw());
             if let Some(texture) = &mut self.texture {
                 texture.set(pixels, egui::TextureOptions::LINEAR);
@@ -490,6 +550,98 @@ impl eframe::App for Dashboard {
                 ));
             });
         });
+        egui::TopBottomPanel::top("agent-controls").show(ctx, |ui| {
+            let mut changed = false;
+            ui.horizontal_wrapped(|ui| {
+                for (mode, label) in [
+                    (ViewMode::Auto, "自动布局"),
+                    (ViewMode::Overview, "总览"),
+                    (ViewMode::Details, "详情"),
+                ] {
+                    changed |= ui
+                        .selectable_value(&mut self.settings.agent_view.mode, mode, label)
+                        .changed();
+                }
+                egui::ComboBox::from_id_salt("agent-filter")
+                    .selected_text(format!("Agent: {}", self.settings.agent_view.agent_filter))
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.settings.agent_view.agent_filter,
+                                "all".into(),
+                                "全部 Agent",
+                            )
+                            .changed();
+                        for kind in AgentKind::ALL {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.settings.agent_view.agent_filter,
+                                    kind.name().to_lowercase(),
+                                    kind.name(),
+                                )
+                                .changed();
+                        }
+                    });
+                let agents = self.agents.lock().unwrap().clone();
+                let origin_name = agents
+                    .origins
+                    .iter()
+                    .find(|o| o.origin_id == self.settings.agent_view.origin_filter)
+                    .map(|o| o.display_name.as_str())
+                    .unwrap_or("全部来源");
+                egui::ComboBox::from_id_salt("origin-filter")
+                    .selected_text(origin_name)
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.settings.agent_view.origin_filter,
+                                "all".into(),
+                                "全部来源",
+                            )
+                            .changed();
+                        for origin in &agents.origins {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.settings.agent_view.origin_filter,
+                                    origin.origin_id.clone(),
+                                    &origin.display_name,
+                                )
+                                .changed();
+                        }
+                    });
+                if self.settings.agent_view.origin_filter != "all"
+                    && agents.origins_ready
+                    && !agents.origins.iter().any(|o| {
+                        o.origin_id == self.settings.agent_view.origin_filter
+                            && o.status != "已停止"
+                    })
+                {
+                    self.settings.agent_view.origin_filter = "all".into();
+                    self.error = "保存的来源已不存在，已恢复全部来源。".into();
+                    changed = true;
+                }
+                for (delta, label) in [(-1, "上一页"), (1, "下一页")] {
+                    if ui.button(label).clicked() {
+                        self.view.lock().unwrap().advance(delta, Instant::now());
+                    }
+                }
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.agent_view.auto_rotate,
+                        format!(
+                            "每 {} 秒轮播",
+                            self.settings.agent_view.rotate_interval_seconds
+                        ),
+                    )
+                    .changed();
+                if ui.button("会话与来源状态").clicked() {
+                    self.show_sessions = !self.show_sessions;
+                }
+            });
+            if changed {
+                self.save();
+            }
+        });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.label(status);
             if !self.error.is_empty() {
@@ -500,11 +652,55 @@ impl eframe::App for Dashboard {
             if let Some(texture) = &self.texture {
                 let available = ui.available_size();
                 let width = available.x.min(available.y * 4.0);
-                ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(width, width / 4.0)));
+                let response = ui.add(
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(egui::vec2(width, width / 4.0))
+                        .sense(egui::Sense::click()),
+                );
+                if response.clicked()
+                    && let Some(pos) = response.interact_pointer_pos()
+                {
+                    let x = (pos.x - response.rect.min.x) * 1920.0 / response.rect.width();
+                    let y = (pos.y - response.rect.min.y) * 480.0 / response.rect.height();
+                    let mut view = self.frame_view.clone();
+                    if view.click(x, y, Instant::now()) {
+                        self.settings.agent_view = view.preferences.clone();
+                        *self.view.lock().unwrap() = view;
+                        self.save();
+                    }
+                }
             } else {
                 ui.spinner();
             }
         });
+        if self.show_sessions {
+            let agents = self.agents.lock().unwrap().clone();
+            egui::Window::new("会话与来源状态").open(&mut self.show_sessions).default_width(650.0).show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(500.0).show(ui, |ui| {
+                    for origin in &agents.origins {
+                        ui.collapsing(format!("{} · {}", origin.display_name, origin.status), |ui| {
+                            ui.label(format!("来源：{}", origin.origin_id));
+                            ui.label(format!("用户：{} · 最后成功：{}", origin.user.as_deref().unwrap_or("未知"), display_time(origin.last_success)));
+                            if let Some(error) = &origin.error { ui.colored_label(egui::Color32::YELLOW, error); }
+                        });
+                    }
+                    ui.separator();
+                    for session in &agents.sessions {
+                        ui.collapsing(format!("{} · {} · {}", session.key.agent_kind.name(), session.usage.project, session.label()), |ui| {
+                            ui.label(format!("会话：{}", session.key.native_session_id));
+                            ui.label(format!("来源：{}", session.key.origin_id));
+                            ui.label(format!("项目路径：{}", session.usage.project_path));
+                            ui.label(format!("日志：{:?}", session.usage.log_path));
+                            ui.label(format!("证据：{} · 实例数 {} · 最后确认 {}", session.evidence, session.instance_count, display_time(session.last_verified_at)));
+                            for instance in agents.instances.iter().filter(|i| i.has_session(&session.key)) { ui.label(format!("PID {} · 创建时间 {}", instance.instance_key.pid, instance.instance_key.process_started_at)); }
+                            if let Some(used) = session.usage.quota_used { ui.label(format!("来源范围额度日志读数：已用 {used:.0}% · 账户归属未知")); }
+                            if session.open_state == OpenState::Unconfirmed { ui.label("运行实例证据尚未确认"); }
+                            ui.label(&session.usage.message);
+                        });
+                    }
+                });
+            });
+        }
         if self.show_settings {
             self.settings_ui(ctx);
         }
@@ -699,6 +895,19 @@ fn set_autostart(enabled: bool) -> Result<()> {
         return Err(e.into());
     }
     Ok(())
+}
+
+fn display_time(timestamp: Option<i64>) -> String {
+    timestamp
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|t| {
+            format!(
+                "{}（{} 秒前）",
+                t.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S"),
+                (chrono::Utc::now().timestamp() - t.timestamp()).max(0)
+            )
+        })
+        .unwrap_or_else(|| "尚未确认".into())
 }
 
 #[cfg(test)]

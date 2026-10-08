@@ -1,7 +1,6 @@
 use crate::{
-    agents::{AgentKind, Usage},
-    config::Settings,
     metrics::Snapshot,
+    session::{AgentSession, AgentSnapshot, OpenState, ViewMode, ViewState, WorkState},
 };
 use anyhow::{Context, Result};
 use fontdue::{Font, FontSettings};
@@ -262,7 +261,7 @@ impl Renderer {
         self.center(&format!("{pct:.0}"), x, y - 28.0, 50, WHITE, true);
         self.center("%", x, y + 24.0, 20, MUTED, false);
     }
-    pub fn render(&mut self, s: &Snapshot, settings: &Settings, t: f64) -> RgbaImage {
+    pub fn render_view(&mut self, s: &Snapshot, view: &ViewState, t: f64) -> RgbaImage {
         for y in 0..480 {
             self.rect(
                 [0.0, y as f32, 1920.0, 1.0],
@@ -303,13 +302,13 @@ impl Renderer {
             MUTED,
             false,
         );
-        self.text("AI AGENTS", (414.0, 28.0), 24, PURPLE, 350.0, true);
-        self.line(&[(959.0, 66.0), (959.0, 452.0)], BORDER, 1.0);
-        for (kind, x) in [(settings.left, 416.0), (settings.right, 977.0)] {
-            self.agent(kind, s.agents.get(&kind).unwrap_or(&Usage::default()), x, t);
-        }
+        self.sessions(&s.agents, view, t);
         self.memory(s);
-        let active = s.agents.values().any(|u| u.working);
+        let active = s
+            .agents
+            .sessions
+            .iter()
+            .any(|s| s.open_state == OpenState::Open && s.work_state == WorkState::Working);
         let bounce = if active {
             (t * std::f64::consts::TAU).sin().abs() * 9.0
         } else {
@@ -506,228 +505,282 @@ impl Renderer {
             );
         }
     }
-    fn agent(&mut self, kind: AgentKind, u: &Usage, x: f32, t: f64) {
-        let accent = match kind {
-            AgentKind::Claude => [217, 119, 87],
-            AgentKind::Codex => CYAN,
-            AgentKind::Cursor => WHITE,
-        };
-        let phase = t.rem_euclid(5.0) as f32 / 5.0;
-        let breath = if phase < 0.5 {
-            phase * 2.0
-        } else {
-            (1.0 - phase) * 2.0
-        };
-        let base = if kind == AgentKind::Claude {
-            0.09
-        } else {
-            0.08
-        };
-        let (alpha, border) = if u.attention {
-            if ((t * 2.0) as u64).is_multiple_of(2) {
-                (0.36, 0.9)
-            } else {
-                (0.1, 0.25)
-            }
-        } else if u.working {
-            (base + 0.13 * breath, 0.12 + 0.28 * breath)
-        } else {
-            (base, 0.0)
-        };
-        self.rounded(
-            [x - 12.0, 56.0, 549.0, 396.0],
-            12.0,
-            blend(PANEL, accent, border),
+    fn sessions(&mut self, snapshot: &AgentSnapshot, view: &ViewState, t: f64) {
+        self.text("AI SESSIONS", (416.0, 28.0), 24, PURPLE, 300.0, true);
+        let sessions: Vec<_> = view
+            .keys
+            .iter()
+            .filter_map(|key| snapshot.sessions.iter().find(|s| s.key == *key))
+            .collect();
+        let opened = sessions
+            .iter()
+            .filter(|s| s.open_state == OpenState::Open)
+            .count();
+        let pending = sessions.len() - opened;
+        let working = sessions
+            .iter()
+            .filter(|s| s.open_state == OpenState::Open && s.work_state == WorkState::Working)
+            .count();
+        let blocked = sessions
+            .iter()
+            .filter(|s| s.open_state == OpenState::Open && s.work_state == WorkState::Blocked)
+            .count();
+        self.right(
+            &format!("已打开 {opened}   工作中 {working}   待处理 {blocked}   待确认 {pending}"),
+            1502.0,
+            34.0,
+            18,
+            MUTED,
+            false,
         );
-        let bg = blend(PANEL, accent, alpha);
-        self.rounded([x - 10.5, 57.5, 546.0, 393.0], 11.0, bg);
-        let name = kind.name().to_uppercase();
-        self.text(&name, (x, 64.0), 24, accent, 200.0, true);
-        let status = if u.waiting {
-            "待输入".into()
-        } else if !u.available {
-            "not found".into()
-        } else if u.working || (!u.project.is_empty() && u.age < 90) {
-            "now".into()
-        } else if u.project.is_empty() {
-            "no session".into()
-        } else if u.age < 3600 {
-            format!("{}m ago", u.age / 60)
-        } else if u.age < 86400 {
-            format!("{}h ago", u.age / 3600)
-        } else {
-            format!("{}d ago", u.age / 86400)
-        };
-        let status_color = if u.waiting {
-            ORANGE
-        } else if u.working || (!u.project.is_empty() && u.age < 90) {
-            GREEN
-        } else {
-            MUTED
-        };
-        self.right(&status, x + 525.0, 70.0, 17, status_color, false);
-        let status_w = self.measure(&status, 17, false);
-        self.rounded(
-            [x + 525.0 - status_w - 18.0, 75.0, 10.0, 10.0],
-            5.0,
-            status_color,
-        );
-        let model_x = x + self.measure(&name, 24, true) + 14.0;
-        let model_w = x + 525.0 - status_w - 28.0 - model_x;
-        if !u.model.is_empty() && self.measure(&u.model, 16, false) < model_w {
-            self.text(&u.model, (model_x, 70.0), 16, LABEL, model_w, false);
+        let visible: Vec<_> = view
+            .range()
+            .filter_map(|i| sessions.get(i).copied())
+            .collect();
+        if visible.is_empty() {
+            self.center("没有打开会话", 959.0, 190.0, 28, MUTED, true);
+            self.center(
+                "等待运行实例或调整来源 / Agent 筛选",
+                959.0,
+                236.0,
+                18,
+                LABEL,
+                false,
+            );
         }
-        let mut project_w = 525.0;
-        if let Some(plan) = &u.plan
-            && plan.total > 0
-        {
-            let badge = format!("步骤 {}/{}", plan.current, plan.total);
-            self.right(&badge, x + 525.0, 108.0, 18, accent, true);
-            project_w -= self.measure(&badge, 18, true) + 16.0;
-        }
-        self.text(
-            if u.project.is_empty() {
-                "暂无本地会话"
+        for (index, session) in visible.iter().enumerate() {
+            let source = snapshot
+                .origins
+                .iter()
+                .find(|o| o.origin_id == session.key.origin_id)
+                .map(|o| o.display_name.as_str())
+                .unwrap_or("来源未知");
+            let short_id = snapshot.short_id(&session.key);
+            let overview = view.mode == ViewMode::Overview;
+            let (x, y, width, height) = if overview {
+                (
+                    416.0 + (index % 3) as f32 * 374.0,
+                    86.0 + (index / 3) as f32 * 145.0,
+                    362.0,
+                    133.0,
+                )
+            } else if visible.len() == 1 {
+                (416.0, 86.0, 1110.0, 290.0)
             } else {
-                &u.project
-            },
-            (x, 104.0),
-            26,
-            WHITE,
-            project_w,
-            true,
-        );
-        let mut message_y = 142.0;
-        if let Some(plan) = &u.plan
-            && plan.total > 0
-        {
-            let count = plan.total.min(40);
-            let width = (525.0 - 4.0 * (count - 1) as f32) / count as f32;
-            for n in 0..count {
-                let c = if n < plan.completed {
-                    blend(bg, accent, 0.5)
-                } else if n + 1 == plan.current {
-                    accent
+                (416.0 + index as f32 * 561.0, 86.0, 549.0, 290.0)
+            };
+            self.session_card(
+                session,
+                source,
+                &short_id,
+                [x, y, width, height],
+                overview,
+                t,
+            );
+        }
+        if view.pages() > 1 {
+            let step = 1110.0 / view.pages() as f32;
+            let gap = 4.0f32.min(step * 0.3);
+            for page in 0..view.pages() {
+                let color = if page == view.page {
+                    [227, 149, 117]
+                } else if page < view.page {
+                    [164, 118, 103]
                 } else {
-                    BAR
+                    [41, 45, 62]
                 };
-                self.rounded([x + n as f32 * (width + 4.0), 142.0, width, 7.0], 3.0, c);
+                self.rect([416.0 + page as f32 * step, 389.0, step - gap, 5.0], color);
             }
-            message_y += 20.0;
         }
-        self.message(
-            if u.message.is_empty() {
-                if let Some(plan) = &u.plan
-                    && !plan.text.is_empty()
-                {
-                    &plan.text
-                } else if u.available {
-                    "等待会话记录。启动 AI 助手后将自动显示项目、消息与计划。"
-                } else {
-                    "尚未发现此助手的日志目录。"
-                }
-            } else {
-                &u.message
-            },
-            x,
-            message_y,
-            525.0,
-            accent,
-        );
-        self.line(&[(x, 328.0), (x + 525.0, 328.0)], BORDER, 1.0);
-        self.text("今日 Token", (x, 340.0), 19, LABEL, 200.0, false);
+        self.line(&[(416.0, 406.0), (1502.0, 406.0)], BORDER, 1.0);
+        let usage = &snapshot.daily_usage;
         self.text(
-            &if kind == AgentKind::Cursor {
+            "今日 Token · 全部来源",
+            (416.0, 418.0),
+            18,
+            LABEL,
+            300.0,
+            false,
+        );
+        self.text(
+            &if usage.available {
+                compact(usage.input.saturating_add(usage.output))
+            } else {
                 "—".into()
-            } else {
-                compact(u.input.saturating_add(u.output))
             },
-            (x, 364.0),
-            46,
+            (736.0, 412.0),
+            36,
             WHITE,
-            330.0,
+            250.0,
             true,
         );
-        if kind != AgentKind::Cursor {
-            self.right(
-                &format!("In  {}", compact(u.input)),
-                x + 525.0,
-                346.0,
-                20,
-                MUTED,
-                false,
-            );
-            self.right(
-                &format!("Out  {}", compact(u.output)),
-                x + 525.0,
-                376.0,
-                20,
-                MUTED,
-                false,
-            );
+        self.right(
+            &if usage.available {
+                format!(
+                    "In {}   Out {}",
+                    compact(usage.input),
+                    compact(usage.output)
+                )
+            } else {
+                "用量未取得".into()
+            },
+            1502.0,
+            414.0,
+            20,
+            MUTED,
+            false,
+        );
+        self.right(&usage.coverage, 1502.0, 444.0, 14, LABEL, false);
+    }
+    fn session_card(
+        &mut self,
+        session: &AgentSession,
+        source: &str,
+        id: &str,
+        bounds: [f32; 4],
+        overview: bool,
+        t: f64,
+    ) {
+        let [x, y, width, height] = bounds;
+        let accent = if session.open_state == OpenState::Unconfirmed {
+            DIM
+        } else {
+            match session.work_state {
+                WorkState::Working => GREEN,
+                WorkState::Blocked => ORANGE,
+                _ => MUTED,
+            }
+        };
+        let flash = session.usage.attention && session.open_state == OpenState::Open;
+        self.rounded(
+            bounds,
+            9.0,
+            if flash {
+                blend(BORDER, accent, (0.2 + 0.2 * (t * 4.0).sin()) as f32)
+            } else {
+                BORDER
+            },
+        );
+        self.rounded([x + 1.0, y + 1.0, width - 2.0, height - 2.0], 8.0, PANEL);
+        if session.open_state == OpenState::Unconfirmed {
+            for n in 0..(width as usize / 12) {
+                self.rect([x + n as f32 * 12.0, y, 6.0, 1.0], DIM);
+                self.rect([x + n as f32 * 12.0, y + height - 1.0, 6.0, 1.0], DIM);
+            }
+            for n in 0..(height as usize / 12) {
+                self.rect([x, y + n as f32 * 12.0, 1.0, 6.0], DIM);
+                self.rect([x + width - 1.0, y + n as f32 * 12.0, 1.0, 6.0], DIM);
+            }
         }
-        if kind == AgentKind::Codex {
-            if let Some(used) = u.quota_used {
-                let remaining = (100.0 - used).clamp(0.0, 100.0) as f32;
-                let c = if remaining > 50.0 {
-                    GREEN
-                } else if remaining > 20.0 {
-                    ORANGE
+        let inset = x + 12.0;
+        self.text(
+            session.key.agent_kind.name(),
+            (inset, y + 9.0),
+            18,
+            accent,
+            115.0,
+            true,
+        );
+        self.right(
+            session.label(),
+            x + width - 12.0,
+            y + 11.0,
+            if overview { 14 } else { 17 },
+            accent,
+            false,
+        );
+        self.text(
+            if session.usage.project.is_empty() {
+                "项目未知"
+            } else {
+                &session.usage.project
+            },
+            (inset, y + 37.0),
+            if overview { 22 } else { 26 },
+            WHITE,
+            width - 24.0,
+            true,
+        );
+        self.text(
+            &format!("{source} · {id}"),
+            (inset, y + 67.0),
+            14,
+            LABEL,
+            width - 24.0,
+            false,
+        );
+        if overview {
+            let summary = session
+                .usage
+                .plan
+                .as_ref()
+                .map(|p| p.text.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&session.usage.message)
+                .replace(['\n', '\r'], " ");
+            self.text(
+                if summary.is_empty() {
+                    "暂无消息"
                 } else {
-                    RED
-                };
+                    &summary
+                },
+                (inset, y + 91.0),
+                16,
+                MUTED,
+                width - 24.0,
+                false,
+            );
+            self.right(
+                &activity(session.usage.age),
+                x + width - 12.0,
+                y + 115.0,
+                11,
+                LABEL,
+                false,
+            );
+        } else {
+            self.text(
+                if session.usage.model.is_empty() {
+                    "模型：未提供"
+                } else {
+                    &session.usage.model
+                },
+                (inset, y + 91.0),
+                16,
+                LABEL,
+                width - 24.0,
+                false,
+            );
+            let mut message_y = y + 116.0;
+            if let Some(plan) = &session.usage.plan {
                 self.text(
-                    &format!("剩余额度 {remaining:.0}%"),
-                    (x, 418.0),
-                    21,
-                    c,
-                    270.0,
-                    true,
-                );
-                let reset = u
-                    .quota_reset
-                    .map(|ts| {
-                        let secs = (ts - chrono::Local::now().timestamp()).max(0);
-                        if secs >= 86400 {
-                            format!("{}天后重置", secs / 86400)
-                        } else if secs >= 3600 {
-                            format!("{}小时后重置", secs / 3600)
-                        } else {
-                            format!("{}分钟后重置", (secs / 60).max(1))
-                        }
-                    })
-                    .unwrap_or_default();
-                self.right(
-                    &format!("日志读数  {reset}"),
-                    x + 525.0,
-                    421.0,
-                    15,
-                    DIM,
+                    &format!("步骤 {}/{} · {}", plan.current, plan.total, plan.text),
+                    (inset, message_y),
+                    17,
+                    accent,
+                    width - 24.0,
                     false,
                 );
-                self.bar([x, 446.0, 525.0, 8.0], remaining, c);
+                message_y += 28.0;
             }
-        } else if kind == AgentKind::Cursor
-            && let Some(used) = u.context_used
-        {
-            self.text(
-                &format!("上下文 {used:.0}%"),
-                (x, 418.0),
-                21,
-                accent,
-                300.0,
-                false,
-            );
-            self.bar(
-                [x, 446.0, 525.0, 8.0],
-                used as f32,
-                if used < 50.0 {
-                    accent
-                } else if used < 80.0 {
-                    ORANGE
+            self.message(
+                if session.usage.message.is_empty() {
+                    "暂无日志消息"
                 } else {
-                    RED
+                    &session.usage.message
                 },
+                inset,
+                message_y,
+                width - 24.0,
+                accent,
+            );
+            self.text(
+                &format!("{} · {}", activity(session.usage.age), session.evidence),
+                (inset, y + height - 27.0),
+                13,
+                LABEL,
+                width - 24.0,
+                false,
             );
         }
     }
@@ -853,5 +906,17 @@ fn compact(n: u64) -> String {
         format!("{value:.1}{suffix}")
     } else {
         format!("{value:.0}{suffix}")
+    }
+}
+
+fn activity(age: u64) -> String {
+    if age == u64::MAX {
+        "最近活动未知".into()
+    } else if age < 60 {
+        "最近活动 <1 分钟".into()
+    } else if age < 3600 {
+        format!("最近活动 {} 分钟前", age / 60)
+    } else {
+        format!("最近活动 {} 小时前", age / 3600)
     }
 }

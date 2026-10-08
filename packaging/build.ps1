@@ -1,4 +1,4 @@
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [string]$ExecutablePath)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $projectRoot
@@ -16,7 +16,12 @@ try {
         throw 'Unexpected package path; packaging aborted.'
     }
     $releaseFiles = @('win-thermalright-ai-monitor.exe', 'README.md', 'LICENSE', 'THIRD_PARTY.md')
-    Copy-Item -LiteralPath (Join-Path $projectRoot 'target\release\win-thermalright-ai-monitor.exe') -Destination $packagePath
+    $releaseExecutable = if ($ExecutablePath) {
+        [IO.Path]::GetFullPath($ExecutablePath)
+    } else {
+        Join-Path $projectRoot 'target\release\win-thermalright-ai-monitor.exe'
+    }
+    Copy-Item -LiteralPath $releaseExecutable -Destination (Join-Path $packagePath 'win-thermalright-ai-monitor.exe')
     foreach ($fileName in @('README.md', 'LICENSE', 'THIRD_PARTY.md')) {
         Copy-Item -LiteralPath (Join-Path $projectRoot $fileName) -Destination $packagePath
     }

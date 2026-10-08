@@ -4,10 +4,13 @@ mod agents;
 mod app;
 mod config;
 mod metrics;
+mod monitor;
 #[cfg(windows)]
 mod power;
+mod probe;
 mod protocol;
 mod render;
+mod session;
 mod usb;
 
 use anyhow::{Context, Result};
@@ -40,6 +43,15 @@ pub struct Args {
     scale: u32,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=256))]
     cores: u32,
+    /// Number of sessions in deterministic demo data.
+    #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(u32).range(0..=256))]
+    demo_sessions: u32,
+    /// Zero-based page for PNG/GIF demo export.
+    #[arg(long, default_value_t = 0)]
+    demo_page: usize,
+    /// Override the configured session layout for this run.
+    #[arg(long, value_enum)]
+    agent_mode: Option<session::ViewMode>,
     /// Send this many demo frames and report actual USB throughput.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10000))]
     benchmark: Option<u32>,
@@ -55,6 +67,11 @@ pub struct Args {
     /// Print local system/agent availability without opening a window or USB.
     #[arg(long)]
     diagnostics: bool,
+    /// Keep collecting for this many seconds before printing diagnostics.
+    #[arg(long, default_value_t = 0, requires = "diagnostics", value_parser = clap::value_parser!(u32).range(0..=300))]
+    diagnostics_seconds: u32,
+    #[arg(long, hide = true)]
+    probe_windows: bool,
 }
 
 fn main() {
@@ -62,15 +79,11 @@ fn main() {
     let headless = std::env::args().any(|arg| {
         matches!(
             arg.as_str(),
-            "--snapshot" | "--gif" | "--benchmark" | "--diagnostics"
+            "--snapshot" | "--gif" | "--benchmark" | "--diagnostics" | "--probe-windows"
         )
     });
     #[cfg(all(windows, not(debug_assertions)))]
-    let console = unsafe {
-        windows_sys::Win32::System::Console::AttachConsole(
-            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
-        ) != 0
-    };
+    let console = attach_parent_console();
     if let Err(error) = execute() {
         eprintln!("{error:#}");
         #[cfg(all(windows, not(debug_assertions)))]
@@ -91,9 +104,39 @@ fn main() {
     }
 }
 
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_parent_console() -> bool {
+    use windows_sys::Win32::{
+        Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType},
+        System::Console::{
+            ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+            STD_OUTPUT_HANDLE,
+        },
+    };
+    // AttachConsole replaces inherited standard handles. Preserve the JSON
+    // pipes of probes and redirected diagnostics before considering it.
+    let redirected = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+        .into_iter()
+        .any(|id| unsafe {
+            matches!(
+                GetFileType(GetStdHandle(id)),
+                FILE_TYPE_DISK | FILE_TYPE_PIPE
+            )
+        });
+    !redirected && unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+}
+
 fn execute() -> Result<()> {
     let args = Args::parse();
-    let cfg = config::Settings::load(args.config.as_deref())?;
+    if args.probe_windows {
+        #[cfg(windows)]
+        println!("{}", serde_json::to_string(&probe::windows_probe()?)?);
+        return Ok(());
+    }
+    let mut cfg = config::Settings::load(args.config.as_deref())?;
+    if let Some(mode) = args.agent_mode {
+        cfg.agent_view.mode = mode;
+    }
     if args.diagnostics {
         let home = args.agent_home.clone().unwrap_or_else(|| {
             directories::UserDirs::new()
@@ -104,11 +147,19 @@ fn execute() -> Result<()> {
         collector.collect();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let s = collector.collect();
-        let agent_status: serde_json::Map<_,_> = s.agents.iter().map(|(kind,u)| (kind.name().to_owned(),serde_json::json!({"available":u.available,"working":u.working,"waiting":u.waiting,"today_input":u.input,"today_output":u.output,"project":u.project,"session_id":u.session_id,"log_path":u.log_path,"last_activity":u.last_activity,"message_characters":u.message.chars().count()}))).collect();
+        let mut monitor = monitor::Monitor::new(home_for(&args), cfg.agents.clone());
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut agents = monitor.collect_once(&stop);
+        let deadline =
+            Instant::now() + std::time::Duration::from_secs(args.diagnostics_seconds as u64);
+        while Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            agents = monitor.tick(&stop);
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &serde_json::json!({"cpu":s.cpu_name,"cpu_percent":s.cpu,"logical_cores":s.cores.len(),"memory_total":s.total_memory,"memory_used":s.used_memory,"cpu_temperature":s.temperature,"processes":s.processes,"uptime_seconds":s.uptime,"agents":agent_status})
+                &serde_json::json!({"cpu":s.cpu_name,"cpu_percent":s.cpu,"logical_cores":s.cores.len(),"memory_total":s.total_memory,"memory_used":s.used_memory,"cpu_temperature":s.temperature,"processes":s.processes,"uptime_seconds":s.uptime,"agents":agents})
             )?
         );
         return Ok(());
@@ -116,8 +167,7 @@ fn execute() -> Result<()> {
     if args.snapshot.is_some() || args.gif.is_some() || args.benchmark.is_some() {
         let mut renderer = render::Renderer::new(cfg.font.as_deref())?;
         if let Some(path) = &args.snapshot {
-            renderer
-                .render(&metrics::Snapshot::demo(0.0, args.cores), &cfg, 0.0)
+            demo_frame(&mut renderer, &args, &cfg, 0.0)
                 .save(path)
                 .with_context(|| format!("Saving {}", path.display()))?;
             println!("Saved {}", path.display());
@@ -128,7 +178,7 @@ fn execute() -> Result<()> {
             encoder.set_repeat(Repeat::Infinite)?;
             for n in 0..args.frames {
                 let t = n as f64 / args.fps as f64;
-                let frame = renderer.render(&metrics::Snapshot::demo(t, args.cores), &cfg, t);
+                let frame = demo_frame(&mut renderer, &args, &cfg, t);
                 let frame = image::imageops::resize(
                     &frame,
                     1920 / args.scale,
@@ -154,7 +204,7 @@ fn execute() -> Result<()> {
             let start = Instant::now();
             for n in 0..count {
                 let t = n as f64 / 15.0;
-                let frame = renderer.render(&metrics::Snapshot::demo(t, args.cores), &cfg, t);
+                let frame = demo_frame(&mut renderer, &args, &cfg, t);
                 lcd.send(&frame, &cfg)?;
             }
             println!(
@@ -167,4 +217,30 @@ fn execute() -> Result<()> {
         return Ok(());
     }
     app::run(args, cfg)
+}
+
+fn home_for(args: &Args) -> PathBuf {
+    args.agent_home.clone().unwrap_or_else(|| {
+        directories::UserDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .unwrap_or_default()
+    })
+}
+
+fn demo_frame(
+    renderer: &mut render::Renderer,
+    args: &Args,
+    settings: &config::Settings,
+    t: f64,
+) -> image::RgbaImage {
+    let snapshot = metrics::Snapshot::demo_count(t, args.cores, args.demo_sessions as usize);
+    let mut view = session::ViewState::default();
+    view.sync(&snapshot.agents, &settings.agent_view, Instant::now(), true);
+    let advance = if settings.agent_view.auto_rotate {
+        (t / settings.agent_view.rotate_interval_seconds as f64) as usize
+    } else {
+        0
+    };
+    view.page = (args.demo_page.saturating_add(advance)) % view.pages();
+    renderer.render_view(&snapshot, &view, t)
 }

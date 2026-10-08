@@ -9,7 +9,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AgentKind {
     Claude,
     Codex,
@@ -26,14 +26,14 @@ impl AgentKind {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     pub current: usize,
     pub total: usize,
     pub completed: usize,
     pub text: String,
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub available: bool,
     pub project: String,
@@ -44,6 +44,10 @@ pub struct Usage {
     pub working: bool,
     pub attention: bool,
     pub waiting: bool,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub project_path: String,
     pub age: u64,
     pub plan: Option<Plan>,
     pub quota_used: Option<f64>,
@@ -65,7 +69,12 @@ struct Session {
     quota_time: String,
     attention_since: Option<SystemTime>,
     subagent: bool,
+    kind: Option<AgentKind>,
+    file_id: String,
+    parse_error: Option<String>,
     last_event: Option<SystemTime>,
+    recent_usage: Option<Usage>,
+    recent_event: Option<SystemTime>,
 }
 
 struct FileStamp {
@@ -89,75 +98,149 @@ impl Collector {
             stamps: HashMap::new(),
         }
     }
-    pub fn collect(&mut self) -> HashMap<AgentKind, Usage> {
+    pub fn collect_logs(&mut self, required: &[(AgentKind, PathBuf)]) -> LogSnapshot {
+        let required: Vec<_> = required
+            .iter()
+            .map(|(kind, path)| (*kind, path.canonicalize().unwrap_or_else(|_| path.clone())))
+            .collect();
         let day = Local::now().date_naive();
         if self.day != day {
             self.sessions.clear();
             self.day = day;
         }
-        let mut result = HashMap::new();
+        let mut result = LogSnapshot {
+            day: Some(self.day),
+            ..Default::default()
+        };
+        let mut budget = 16 * 1024 * 1024;
         let mut present = HashSet::new();
         let mut discovered = HashSet::new();
         for kind in AgentKind::ALL {
-            let root = self.home.join(match kind {
-                AgentKind::Claude => ".claude/projects",
-                AgentKind::Codex => ".codex/sessions",
-                AgentKind::Cursor => ".cursor/projects",
+            let root = if kind == AgentKind::Codex {
+                std::env::var_os("CODEX_HOME")
+                    .map(PathBuf::from)
+                    .map(|p| p.join("sessions"))
+            } else if kind == AgentKind::Claude {
+                std::env::var_os("CLAUDE_CONFIG_DIR")
+                    .map(PathBuf::from)
+                    .map(|p| p.join("projects"))
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
+                self.home.join(match kind {
+                    AgentKind::Claude => ".claude/projects",
+                    AgentKind::Codex => ".codex/sessions",
+                    AgentKind::Cursor => ".cursor/projects",
+                })
             });
             let mut latest: Option<(SystemTime, Usage, String)> = None;
             let mut daily: HashMap<String, (u64, u64)> = HashMap::new();
             let mut quota: Option<(String, Option<f64>, Option<i64>)> = None;
             let mut files = Vec::new();
-            for entry in walkdir::WalkDir::new(&root)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(Result::ok)
-            {
-                let path = entry.path();
-                if !entry.file_type().is_file() || path.extension().is_none_or(|e| e != "jsonl") {
-                    continue;
-                }
-                let relative = path.strip_prefix(&root).unwrap_or(path);
-                if kind == AgentKind::Claude && relative.components().count() != 2 {
-                    continue;
-                }
-                if kind == AgentKind::Cursor
-                    && !relative
-                        .components()
-                        .any(|c| c.as_os_str() == "agent-transcripts")
-                {
-                    continue;
-                }
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
-                };
-                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                discovered.insert(path.to_path_buf());
-                let activity = if kind == AgentKind::Codex {
-                    let stamp = self.stamps.entry(path.to_path_buf()).or_insert(FileStamp {
-                        size: u64::MAX,
-                        modified,
-                        activity: modified,
-                    });
-                    // NTFS may leave LastWriteTime unchanged until the writer closes
-                    // its handle. Size detects appends; embedded timestamps select
-                    // the real latest session, including one spanning midnight.
-                    if stamp.size != metadata.len() || stamp.modified != modified {
-                        stamp.activity = last_record_time(path).unwrap_or(modified);
-                        stamp.size = metadata.len();
-                        stamp.modified = modified;
+            let root = root.canonicalize().unwrap_or(root);
+            let mut roots = vec![root.clone()];
+            if matches!(kind, AgentKind::Codex | AgentKind::Claude) {
+                for (_, path) in required.iter().filter(|(k, _)| *k == kind) {
+                    if let Some(log_root) = path.ancestors().find(|p| {
+                        p.file_name().is_some_and(|n| {
+                            n == if kind == AgentKind::Claude {
+                                "projects"
+                            } else {
+                                "sessions"
+                            }
+                        })
+                    }) {
+                        let log_root = log_root
+                            .canonicalize()
+                            .unwrap_or_else(|_| log_root.to_path_buf());
+                        if !roots.contains(&log_root) {
+                            roots.push(log_root);
+                        }
                     }
-                    stamp.activity
-                } else {
-                    modified
-                };
-                files.push((path.to_path_buf(), metadata.len(), modified, activity));
+                }
             }
-            files.sort_unstable_by_key(|(_, _, _, activity)| std::cmp::Reverse(*activity));
+            for scan_root in roots {
+                for entry in walkdir::WalkDir::new(&scan_root).follow_links(false) {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            if error
+                                .io_error()
+                                .is_none_or(|e| e.kind() != std::io::ErrorKind::NotFound)
+                            {
+                                result.errors.push(error.to_string());
+                            }
+                            continue;
+                        }
+                    };
+                    let path = entry.path();
+                    if !entry.file_type().is_file() || path.extension().is_none_or(|e| e != "jsonl")
+                    {
+                        continue;
+                    }
+                    let relative = path.strip_prefix(&scan_root).unwrap_or(path);
+                    if kind == AgentKind::Claude && relative.components().count() != 2 {
+                        continue;
+                    }
+                    if kind == AgentKind::Cursor
+                        && !relative
+                            .components()
+                            .any(|c| c.as_os_str() == "agent-transcripts")
+                    {
+                        continue;
+                    }
+                    let metadata = match entry.metadata() {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            result.errors.push(error.to_string());
+                            continue;
+                        }
+                    };
+                    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    discovered.insert(path.to_path_buf());
+                    let activity = if kind == AgentKind::Codex {
+                        let stamp = self.stamps.entry(path.to_path_buf()).or_insert(FileStamp {
+                            size: u64::MAX,
+                            modified,
+                            activity: modified,
+                        });
+                        // NTFS may leave LastWriteTime unchanged until the writer closes
+                        // its handle. Size detects appends; embedded timestamps select
+                        // the real latest session, including one spanning midnight.
+                        if stamp.size != metadata.len() || stamp.modified != modified {
+                            stamp.activity = last_record_time(path).unwrap_or(modified);
+                            stamp.size = metadata.len();
+                            stamp.modified = modified;
+                        }
+                        stamp.activity
+                    } else {
+                        modified
+                    };
+                    files.push((path.to_path_buf(), metadata.len(), modified, activity));
+                }
+            }
+            for (_, path) in required.iter().filter(|(k, _)| *k == kind) {
+                if !files.iter().any(|(p, _, _, _)| p == path)
+                    && let Ok(meta) = std::fs::metadata(path)
+                {
+                    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    files.push((path.clone(), meta.len(), modified, modified));
+                }
+            }
+            files.sort_unstable_by_key(|(path, _, _, activity)| {
+                (
+                    !required.iter().any(|(_, p)| p == path),
+                    std::cmp::Reverse(*activity),
+                )
+            });
             // Read today's active logs plus recent fallback sessions. Activity
             // comes from the transcript on Codex, not NTFS write timestamps.
             for (index, (path, size, modified, activity)) in files.into_iter().enumerate() {
-                if index >= 8 && DateTime::<Local>::from(activity).date_naive() < self.day {
+                if index >= 8
+                    && DateTime::<Local>::from(activity).date_naive() < self.day
+                    && !required.iter().any(|(_, p)| p == &path)
+                {
                     continue;
                 }
                 let path = path.as_path();
@@ -169,11 +252,29 @@ impl Collector {
                 {
                     *session = Session::default();
                 }
+                let file_id = local_file_id(path);
+                if !session.file_id.is_empty() && session.file_id != file_id {
+                    *session = Session::default();
+                }
+                session.file_id = file_id;
+                session.kind = Some(kind);
                 session.modified = Some(modified);
-                if size > session.offset {
-                    let _ = read_new(path, session, kind, self.day);
+                let before = session.offset;
+                if size > session.offset
+                    && budget > 0
+                    && let Err(error) = read_new_limited(path, session, kind, self.day, budget)
+                {
+                    result.errors.push(format!("{}: {error}", path.display()));
+                }
+                budget = budget.saturating_sub((session.offset - before) as usize);
+                if let Some(error) = &session.parse_error {
+                    result.errors.push(format!("{}: {error}", path.display()));
+                }
+                if session.offset < size {
+                    result.backfilling = true;
                 }
                 for (id, tokens) in &session.tokens {
+                    result.events.push((kind, id.clone(), *tokens));
                     let target = daily.entry(id.clone()).or_default();
                     target.0 = target.0.max(tokens.0);
                     target.1 = target.1.max(tokens.1);
@@ -201,7 +302,7 @@ impl Collector {
                     continue;
                 }
                 let active_at = session.last_event.unwrap_or(activity);
-                if latest.as_ref().is_none_or(|v| active_at > v.0) {
+                {
                     let mut usage = session.usage.clone();
                     usage.age = active_at.elapsed().unwrap_or_default().as_secs();
                     usage.working = usage.working && usage.age < 90;
@@ -228,10 +329,21 @@ impl Collector {
                             .map(|c| c.as_os_str().to_string_lossy().into_owned())
                             .unwrap_or_default();
                     }
-                    latest = Some((active_at, usage, sid));
+                    usage.available = true;
+                    usage.input = session.tokens.values().map(|v| v.0).sum();
+                    usage.output = session.tokens.values().map(|v| v.1).sum();
+                    if kind == AgentKind::Cursor {
+                        cursor_details(&self.home, &sid, &mut usage);
+                    }
+                    result.sessions.push((kind, usage.clone()));
+                    if latest.as_ref().is_none_or(|v| active_at > v.0) {
+                        latest = Some((active_at, usage, sid));
+                    }
                 }
             }
             let (mut usage, sid) = latest.map(|(_, u, s)| (u, s)).unwrap_or_default();
+            usage.input = 0;
+            usage.output = 0;
             usage.available = root.exists();
             for (input, output) in daily.values() {
                 usage.input = usage.input.saturating_add(*input);
@@ -244,12 +356,187 @@ impl Collector {
             if kind == AgentKind::Cursor {
                 cursor_details(&self.home, &sid, &mut usage);
             }
-            result.insert(kind, usage);
+            result.legacy.insert(kind, usage);
         }
         self.sessions.retain(|p, _| present.contains(p));
         self.stamps.retain(|p, _| discovered.contains(p));
         result
     }
+    #[cfg(test)]
+    pub fn collect(&mut self) -> HashMap<AgentKind, Usage> {
+        self.collect_logs(&[]).legacy
+    }
+
+    pub fn offsets(&mut self) -> HashMap<String, (String, u64)> {
+        let day = Local::now().date_naive();
+        if self.day != day {
+            self.sessions.clear();
+            self.day = day;
+        }
+        self.sessions
+            .iter()
+            .map(|(p, s)| {
+                (
+                    p.to_string_lossy().into_owned(),
+                    (s.file_id.clone(), s.offset),
+                )
+            })
+            .collect()
+    }
+    pub fn ingest(&mut self, files: &[crate::probe::RemoteFile]) -> LogSnapshot {
+        let day = Local::now().date_naive();
+        if self.day != day {
+            self.sessions.clear();
+            self.day = day;
+        }
+        let mut result = LogSnapshot {
+            day: Some(self.day),
+            ..Default::default()
+        };
+        for file in files {
+            if file
+                .next_offset
+                .is_some_and(|next| next < file.offset || next > file.size)
+            {
+                result
+                    .errors
+                    .push(format!("{}: invalid physical log cursor", file.path));
+                continue;
+            }
+            let path = PathBuf::from(&file.path);
+            let session = self.sessions.entry(path.clone()).or_default();
+            if session.file_id != file.file_id || file.offset == 0 && session.offset != 0 {
+                *session = Session::default();
+            }
+            if file.offset != session.offset {
+                result
+                    .errors
+                    .push(format!("{}: log cursor mismatch", file.path));
+                continue;
+            }
+            session.file_id = file.file_id.clone();
+            session.kind = Some(file.kind);
+            for line in file.data.split_inclusive('\n') {
+                if !line.ends_with('\n') {
+                    break;
+                }
+                session.offset += line.len() as u64;
+                match serde_json::from_str(line) {
+                    Ok(value) => apply(session, file.kind, &value, self.day),
+                    Err(error) => session.parse_error = Some(error.to_string()),
+                }
+            }
+            if let Some(next) = file.next_offset {
+                session.offset = next;
+            }
+            if !file.recent_data.is_empty() {
+                let mut recent = Session::default();
+                for line in file.recent_data.lines() {
+                    match serde_json::from_str(line) {
+                        Ok(value) => apply(&mut recent, file.kind, &value, self.day),
+                        Err(error) => result
+                            .errors
+                            .push(format!("{}: recent log: {error}", file.path)),
+                    }
+                }
+                if recent.last_event.is_some() {
+                    if recent.usage.model.is_empty() {
+                        recent.usage.model = session.usage.model.clone();
+                    }
+                    if session.session_id.is_empty() {
+                        session.session_id = recent.session_id.clone();
+                    }
+                    session.recent_event = recent.last_event;
+                    session.recent_usage = Some(recent.usage);
+                }
+            }
+            if session.offset < file.size {
+                result.backfilling = true;
+            }
+        }
+        for (path, session) in &self.sessions {
+            let Some(kind) = session.kind else {
+                continue;
+            };
+            if let Some(error) = &session.parse_error {
+                result.errors.push(format!("{}: {error}", path.display()));
+            }
+            for (id, tokens) in &session.tokens {
+                result.events.push((kind, id.clone(), *tokens));
+            }
+            if session.subagent {
+                continue;
+            }
+            let mut usage = if session.recent_event >= session.last_event {
+                session
+                    .recent_usage
+                    .as_ref()
+                    .unwrap_or(&session.usage)
+                    .clone()
+            } else {
+                session.usage.clone()
+            };
+            usage.session_id = if session.session_id.is_empty() {
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                session.session_id.clone()
+            };
+            usage.log_path = Some(path.clone());
+            usage.last_activity = session
+                .last_event
+                .max(session.recent_event)
+                .map(DateTime::<Utc>::from);
+            usage.available = true;
+            usage.input = session.tokens.values().map(|v| v.0).sum();
+            usage.output = session.tokens.values().map(|v| v.1).sum();
+            result.sessions.push((kind, usage));
+        }
+        result
+    }
+}
+
+#[derive(Default)]
+pub struct LogSnapshot {
+    pub day: Option<NaiveDate>,
+    pub sessions: Vec<(AgentKind, Usage)>,
+    pub events: Vec<(AgentKind, String, (u64, u64))>,
+    pub backfilling: bool,
+    pub errors: Vec<String>,
+    legacy: HashMap<AgentKind, Usage>,
+}
+
+fn local_file_id(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        if let Ok(file) = File::open(path) {
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } != 0 {
+                return format!(
+                    "{}:{}:{}",
+                    info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+                );
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            return format!("{}:{}", metadata.dev(), metadata.ino());
+        }
+    }
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.created().ok())
+        .map(|t| format!("{t:?}"))
+        .unwrap_or_default()
 }
 
 /// Read the latest complete record timestamp without parsing historical bodies.
@@ -283,28 +570,49 @@ fn last_record_time(path: &Path) -> Option<SystemTime> {
         .map(SystemTime::from)
 }
 
+#[cfg(test)]
 fn read_new(
     path: &Path,
     session: &mut Session,
     kind: AgentKind,
     day: NaiveDate,
 ) -> std::io::Result<()> {
+    read_new_limited(path, session, kind, day, 16 * 1024 * 1024)
+}
+fn read_new_limited(
+    path: &Path,
+    session: &mut Session,
+    kind: AgentKind,
+    day: NaiveDate,
+    limit: usize,
+) -> std::io::Result<()> {
+    use std::io::Read;
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(session.offset))?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     // Limit one pass so a large initial transcript cannot pin the collector forever.
     let mut consumed = 0;
-    while consumed < 16 * 1024 * 1024 {
+    while consumed < limit {
         line.clear();
-        let n = reader.read_until(b'\n', &mut line)?;
+        let n = (&mut reader)
+            .take(1024 * 1024 + 1)
+            .read_until(b'\n', &mut line)?;
+        if n > 1024 * 1024 {
+            session.parse_error = Some("JSONL record exceeds 1 MiB".into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "JSONL record exceeds 1 MiB",
+            ));
+        }
         if n == 0 || line.last() != Some(&b'\n') {
             break;
         }
         session.offset += n as u64;
         consumed += n;
-        if let Ok(value) = serde_json::from_slice::<Value>(&line) {
-            apply(session, kind, &value, day);
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(value) => apply(session, kind, &value, day),
+            Err(error) => session.parse_error = Some(error.to_string()),
         }
     }
     Ok(())
@@ -355,6 +663,7 @@ fn state(session: &mut Session, waiting: bool, timestamp: &str) {
     if !waiting {
         session.attention_since = None;
     }
+    session.usage.blocked = false;
     session.usage.waiting = waiting;
     session.usage.working = !waiting;
 }
@@ -396,6 +705,9 @@ fn apply(session: &mut Session, kind: AgentKind, v: &Value, day: NaiveDate) {
     if v["isSidechain"].as_bool() == Some(true) {
         return;
     }
+    if let Some(id) = v["sessionId"].as_str() {
+        session.session_id = id.to_owned();
+    }
     let timestamp = string(&v["timestamp"]);
     let record_time = DateTime::parse_from_rfc3339(timestamp).ok();
     let today = record_time.is_some_and(|t| t.with_timezone(&Local).date_naive() == day);
@@ -403,6 +715,7 @@ fn apply(session: &mut Session, kind: AgentKind, v: &Value, day: NaiveDate) {
         session.last_event = Some(session.last_event.map_or(at, |previous| previous.max(at)));
     }
     if !string(&v["cwd"]).is_empty() {
+        session.usage.project_path = string(&v["cwd"]).to_owned();
         session.usage.project = project(string(&v["cwd"]));
     }
     if kind == AgentKind::Codex {
@@ -410,6 +723,7 @@ fn apply(session: &mut Session, kind: AgentKind, v: &Value, day: NaiveDate) {
         let ty = string(&p["type"]);
         if string(&v["type"]) == "session_meta" {
             session.session_id = string(&p["id"]).to_owned();
+            session.usage.project_path = string(&p["cwd"]).to_owned();
             session.usage.project = project(string(&p["cwd"]));
             session.subagent =
                 p["source"].get("subagent").is_some() || string(&p["source"]) == "subagent";
@@ -499,7 +813,10 @@ fn apply(session: &mut Session, kind: AgentKind, v: &Value, day: NaiveDate) {
                     }
                 }
             }
-            _ if ty.contains("approval_request") => state(session, true, timestamp),
+            _ if ty.contains("approval_request") => {
+                state(session, true, timestamp);
+                session.usage.blocked = true;
+            }
             _ => {}
         }
     } else {
@@ -533,18 +850,32 @@ fn apply(session: &mut Session, kind: AgentKind, v: &Value, day: NaiveDate) {
                 session.usage.message = message;
             }
             let mut tool = false;
+            let mut asks_user = false;
             if let Some(blocks) = msg["content"].as_array() {
                 for block in blocks {
                     if string(&block["type"]) == "tool_use" {
                         tool = true;
+                        asks_user |= string(&block["name"]) == "AskUserQuestion";
                         if string(&block["name"]) == "TodoWrite" {
                             session.usage.plan = plan(&block["input"]["todos"]);
                         }
                     }
                 }
             }
-            state(session, !tool, timestamp);
-            if !tool {
+            let waiting = if kind == AgentKind::Claude {
+                match string(&msg["stop_reason"]) {
+                    "end_turn" | "stop_sequence" | "max_tokens" => true,
+                    "tool_use" => false,
+                    _ => !tool,
+                }
+            } else {
+                !tool
+            };
+            state(session, waiting, timestamp);
+            if kind == AgentKind::Claude && !waiting && asks_user {
+                session.usage.blocked = true;
+            }
+            if waiting {
                 session.usage.plan = None;
             }
             if kind == AgentKind::Claude && today {
@@ -596,6 +927,73 @@ fn cursor_details(home: &Path, sid: &str, usage: &mut Usage) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_stop_reasons_and_explicit_questions_determine_log_state() {
+        let mut session = Session::default();
+        let day = Local::now().date_naive();
+        apply(
+            &mut session,
+            AgentKind::Claude,
+            &serde_json::json!({
+                "type":"assistant", "message":{"stop_reason":"tool_use","content":[{"type":"text","text":"continuing"}]}
+            }),
+            day,
+        );
+        assert!(session.usage.working);
+        apply(
+            &mut session,
+            AgentKind::Claude,
+            &serde_json::json!({
+                "type":"assistant", "message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"AskUserQuestion"}]}
+            }),
+            day,
+        );
+        assert!(session.usage.blocked);
+        apply(
+            &mut session,
+            AgentKind::Claude,
+            &serde_json::json!({
+                "type":"user", "message":{"content":[{"type":"tool_result","content":"answered"}]}
+            }),
+            day,
+        );
+        assert!(!session.usage.blocked);
+        assert!(session.usage.working);
+        apply(
+            &mut session,
+            AgentKind::Claude,
+            &serde_json::json!({
+                "type":"assistant", "message":{"stop_reason":"end_turn","content":[{"type":"tool_use","name":"AskUserQuestion"}]}
+            }),
+            day,
+        );
+        assert!(session.usage.waiting);
+        assert!(!session.usage.blocked);
+    }
+
+    #[test]
+    fn native_claude_custom_root_includes_closed_sessions_in_daily_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("other-account/projects/project");
+        std::fs::create_dir_all(&root).unwrap();
+        for (sid, tokens) in [("live", 10), ("closed", 20)] {
+            let record = serde_json::json!({"sessionId":sid,"timestamp":Local::now().to_rfc3339(),
+                "type":"assistant","message":{"id":sid,"stop_reason":"end_turn","content":[],
+                    "usage":{"input_tokens":tokens,"output_tokens":1}}});
+            std::fs::write(root.join(format!("{sid}.jsonl")), format!("{record}\n")).unwrap();
+        }
+        let mut collector = Collector::new(home.path().to_path_buf());
+        let snapshot = collector.collect_logs(&[(AgentKind::Claude, root.join("live.jsonl"))]);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|(kind, _, _)| *kind == AgentKind::Claude)
+                .map(|(_, _, (input, _))| *input)
+                .sum::<u64>(),
+            30
+        );
+    }
     use super::*;
     use serde_json::json;
     fn write_codex_log(
@@ -720,6 +1118,142 @@ mod tests {
         )
         .unwrap();
         assert_eq!(last_record_time(file.path()), Some(SystemTime::from(now)));
+    }
+
+    #[test]
+    fn independently_collects_same_project_sessions_including_old_live_log() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        for n in 0..12 {
+            write_codex_log(
+                &root.join(format!("recent-{n}.jsonl")),
+                &format!("recent-{n}"),
+                "C:/same",
+                serde_json::json!("cli"),
+                now,
+                &format!("message {n}"),
+            );
+        }
+        let old = root.join("old.jsonl");
+        write_codex_log(
+            &old,
+            "old-live",
+            "C:/same",
+            serde_json::json!("cli"),
+            now - chrono::Duration::days(30),
+            "idle for a month",
+        );
+        let mut collector = Collector::new(home.path().into());
+        let logs = collector.collect_logs(&[(AgentKind::Codex, old)]);
+        assert_eq!(logs.sessions.len(), 13);
+        assert_eq!(
+            logs.sessions
+                .iter()
+                .find(|(_, u)| u.session_id == "old-live")
+                .unwrap()
+                .1
+                .message,
+            "idle for a month"
+        );
+        assert_eq!(logs.events.iter().map(|(_, _, t)| t.0).sum::<u64>(), 1200);
+    }
+
+    #[test]
+    fn remote_offsets_replacement_half_line_and_local_midnight_reset() {
+        let home = tempfile::tempdir().unwrap();
+        let mut collector = Collector::new(home.path().into());
+        let now = Utc::now();
+        let line = serde_json::json!({"timestamp":now,"type":"assistant","sessionId":"session","cwd":"/project","message":{"id":"message","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":10,"output_tokens":3}}}).to_string() + "\n";
+        let mut file = crate::probe::RemoteFile {
+            path: "/home/user/custom/session.jsonl".into(),
+            kind: AgentKind::Claude,
+            file_id: "dev:ino".into(),
+            size: line.len() as u64 + 10,
+            offset: 0,
+            data: line.clone() + "{\"partial\"",
+            next_offset: None,
+            recent_data: String::new(),
+        };
+        let first = collector.ingest(&[file.clone()]);
+        assert!(first.backfilling);
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(collector.offsets()[&file.path].1, line.len() as u64);
+        file.offset = 0;
+        file.file_id = "dev:replacement".into();
+        file.data = line.clone();
+        let second = collector.ingest(&[file.clone()]);
+        assert_eq!(second.events[0].2, (10, 3));
+        assert_eq!(second.sessions[0].1.session_id, "session");
+        collector.day = Local::now().date_naive() - chrono::Duration::days(1);
+        assert!(collector.offsets().is_empty());
+        let third = collector.ingest(&[file]);
+        assert_eq!(third.events.len(), 1);
+    }
+    #[test]
+    fn recent_state_is_independent_of_usage_backfill_and_cannot_double_count_tokens() {
+        let home = tempfile::tempdir().unwrap();
+        let mut collector = Collector::new(home.path().into());
+        let now = Utc::now();
+        let metadata = json!({"timestamp":now - chrono::Duration::hours(2),"type":"session_meta","payload":{"id":"live","cwd":"/project"}});
+        let started = json!({"timestamp":now - chrono::Duration::hours(1),"type":"event_msg","payload":{"type":"task_started"}});
+        let tokens = json!({"timestamp":now,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20}}}});
+        let completed =
+            json!({"timestamp":now,"type":"event_msg","payload":{"type":"task_complete"}});
+        let lines = |values: &[serde_json::Value]| {
+            values
+                .iter()
+                .map(|v| v.to_string() + "\n")
+                .collect::<String>()
+        };
+        let mut file = crate::probe::RemoteFile {
+            path: "/rollout-live.jsonl".into(),
+            kind: AgentKind::Codex,
+            file_id: "inode".into(),
+            size: 3_000_000,
+            offset: 0,
+            next_offset: Some(2_000_000),
+            data: lines(&[metadata.clone(), started]),
+            recent_data: lines(&[metadata, tokens.clone(), completed.clone()]),
+        };
+        let first = collector.ingest(&[file.clone()]);
+        assert!(first.backfilling);
+        assert!(first.sessions[0].1.waiting);
+        assert!(!first.sessions[0].1.working);
+        assert_eq!(first.sessions[0].1.last_activity, Some(now));
+        assert!(first.events.is_empty());
+        assert_eq!(collector.offsets()[&file.path].1, 2_000_000);
+
+        // Replaying the independent tail never contributes to the usage ledger.
+        file.offset = 2_000_000;
+        file.data.clear();
+        let repeated = collector.ingest(&[file.clone()]);
+        assert!(repeated.events.is_empty());
+        assert!(repeated.sessions[0].1.waiting);
+
+        // Historical ingestion counts the event once when its cursor reaches it.
+        file.data = lines(&[tokens, completed]);
+        file.next_offset = Some(file.size);
+        let final_read = collector.ingest(&[file.clone()]);
+        assert!(!final_read.backfilling);
+        assert_eq!(final_read.events.len(), 1);
+        assert_eq!(final_read.sessions[0].1.input, 100);
+        assert_eq!(final_read.sessions[0].1.output, 20);
+        file.offset = file.size;
+        file.data.clear();
+        let again = collector.ingest(&[file.clone()]);
+        assert_eq!(again.events.len(), 1);
+        assert_eq!(again.events[0].2, (100, 20));
+
+        // Replacement must reset the previous file's tail and accounting.
+        file.file_id = "replacement".into();
+        file.offset = 0;
+        file.next_offset = Some(0);
+        file.recent_data.clear();
+        let replaced = collector.ingest(&[file]);
+        assert!(replaced.events.is_empty());
+        assert!(!replaced.sessions[0].1.waiting);
     }
     #[test]
     fn codex_cumulative_dedup_and_turn_boundaries() {
