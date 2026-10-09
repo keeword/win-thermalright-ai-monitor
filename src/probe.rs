@@ -241,6 +241,37 @@ fn codex_role(args: &[String]) -> &'static str {
     }
 }
 
+#[cfg(any(windows, test))]
+fn remove_codex_frontends(
+    instances: &mut Vec<LiveInstance>,
+    frontend_peers: &HashMap<InstanceKey, std::collections::HashSet<u32>>,
+    mut still_current: impl FnMut(&InstanceKey) -> bool,
+) {
+    let servers: std::collections::HashSet<_> = instances
+        .iter()
+        .filter(|i| {
+            i.agent_kind == AgentKind::Codex
+                && !i.shared_session_keys.is_empty()
+                && i.open_state == OpenState::Open
+                && i.error.is_none()
+                && still_current(&i.instance_key)
+        })
+        .map(|i| (i.instance_key.origin_id.clone(), i.instance_key.pid))
+        .collect();
+    instances.retain(|i| {
+        let duplicate = i.agent_kind == AgentKind::Codex
+            && !i.is_linked()
+            && i.open_state == OpenState::Open
+            && frontend_peers.get(&i.instance_key).is_some_and(|peers| {
+                peers
+                    .iter()
+                    .any(|pid| servers.contains(&(i.instance_key.origin_id.clone(), *pid)))
+            })
+            && still_current(&i.instance_key);
+        !duplicate
+    });
+}
+
 #[cfg(windows)]
 pub fn windows_probe() -> anyhow::Result<ProbeResult> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
@@ -309,6 +340,7 @@ pub fn windows_probe() -> anyhow::Result<ProbeResult> {
     let domain = std::env::var("COMPUTERNAME")
         .ok()
         .map(|name| format!("win32:{}", name.to_lowercase()));
+    let mut frontend_peers = HashMap::new();
     for (pid, kind) in &candidates {
         // Prefer the actual CLI child to its package launcher.
         if system
@@ -339,8 +371,15 @@ pub fn windows_probe() -> anyhow::Result<ProbeResult> {
         let mut paths = vec![];
         let mut error = None;
         if *kind == AgentKind::Codex {
-            match windows_handles::rollouts(pid.as_u32(), started) {
-                Ok(found) => paths = found,
+            match windows_handles::codex_handles(pid.as_u32(), started) {
+                Ok(found) => {
+                    // Only a CLI without its own rollout can be a duplicate frontend.
+                    // Failed inspections and ambiguous rollout owners stay visible.
+                    if !shared_server && found.rollouts.is_empty() {
+                        frontend_peers.insert(key.clone(), found.unix_peer_pids);
+                    }
+                    paths = found.rollouts;
+                }
                 Err(e) => {
                     result.complete = false;
                     result.errors.push(e.to_string());
@@ -454,6 +493,9 @@ pub fn windows_probe() -> anyhow::Result<ProbeResult> {
             error: error.or(unlinked_error),
         });
     }
+    remove_codex_frontends(&mut result.instances, &frontend_peers, |key| {
+        process_time(key.pid).is_ok_and(|started| started == key.process_started_at)
+    });
     Ok(result)
 }
 #[cfg(test)]
@@ -546,6 +588,96 @@ fn windows_sid() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn codex_instance(pid: u32) -> LiveInstance {
+        LiveInstance {
+            instance_key: InstanceKey {
+                origin_id: "windows:test".into(),
+                boot_id: "boot".into(),
+                pid,
+                process_started_at: 100 + pid as u64,
+            },
+            agent_kind: AgentKind::Codex,
+            session_key: None,
+            shared_session_keys: vec![],
+            native_work_state: None,
+            last_verified_at: 1000,
+            open_state: OpenState::Open,
+            error: None,
+        }
+    }
+    fn codex_server() -> LiveInstance {
+        let mut server = codex_instance(100);
+        server.shared_session_keys = vec![SessionKey {
+            origin_id: server.instance_key.origin_id.clone(),
+            agent_kind: AgentKind::Codex,
+            native_session_id: "main".into(),
+        }];
+        server
+    }
+    #[test]
+    fn windows_frontends_require_a_verified_peer_with_identified_sessions() {
+        let server = codex_server();
+        let connected = codex_instance(101);
+        let unrelated = codex_instance(102);
+        let ambiguous = codex_instance(103);
+        let mut linked = codex_instance(104);
+        linked.session_key = server.shared_session_keys.first().cloned();
+        let mut claude = codex_instance(105);
+        claude.agent_kind = AgentKind::Claude;
+        let peers = HashMap::from([
+            (connected.instance_key.clone(), [100].into()),
+            (unrelated.instance_key.clone(), [999].into()),
+            (linked.instance_key.clone(), [100].into()),
+            (claude.instance_key.clone(), [100].into()),
+        ]);
+        let mut instances = vec![server, connected, unrelated, ambiguous, linked, claude];
+        remove_codex_frontends(&mut instances, &peers, |_| true);
+        assert_eq!(
+            instances
+                .iter()
+                .map(|i| i.instance_key.pid)
+                .collect::<Vec<_>>(),
+            vec![100, 102, 103, 104, 105]
+        );
+        // Missing/failed connection inspection must preserve unlinked instances.
+        let mut instances = vec![codex_server(), codex_instance(101)];
+        remove_codex_frontends(&mut instances, &HashMap::new(), |_| true);
+        assert_eq!(instances.len(), 2);
+    }
+    #[test]
+    fn windows_frontends_survive_stale_identities_and_unconfirmed_servers() {
+        let frontend = codex_instance(101);
+        let peers = HashMap::from([(frontend.instance_key.clone(), [100].into())]);
+        for stale_pid in [100, 101] {
+            let mut instances = vec![codex_server(), frontend.clone()];
+            remove_codex_frontends(&mut instances, &peers, |key| key.pid != stale_pid);
+            assert_eq!(instances.len(), 2);
+        }
+        let mut servers = vec![];
+        let mut server = codex_server();
+        server.error = Some("inspection failed".into());
+        servers.push(server);
+        let mut server = codex_server();
+        server.open_state = OpenState::Unconfirmed;
+        servers.push(server);
+        let mut server = codex_server();
+        server.shared_session_keys.clear();
+        servers.push(server);
+        let mut server = codex_server();
+        server.instance_key.origin_id = "other-user".into();
+        servers.push(server);
+        for server in servers {
+            let mut instances = vec![server, frontend.clone()];
+            remove_codex_frontends(&mut instances, &peers, |_| true);
+            assert_eq!(instances.len(), 2);
+        }
+        // A peer observation for an earlier PID incarnation cannot suppress a new one.
+        let mut reused = frontend;
+        reused.instance_key.process_started_at += 1;
+        let mut instances = vec![codex_server(), reused];
+        remove_codex_frontends(&mut instances, &peers, |_| true);
+        assert_eq!(instances.len(), 2);
+    }
     #[test]
     fn codex_server_and_updater_are_distinct_from_cli() {
         let role =
