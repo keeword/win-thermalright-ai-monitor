@@ -655,6 +655,7 @@ impl Dashboard {
         }
     }
     fn close_preview(&mut self, ctx: &egui::Context) {
+        self.show_settings = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
     fn can_hide(&self) -> bool {
@@ -676,75 +677,109 @@ impl Dashboard {
             self.shutdown.store(true, Ordering::Relaxed);
         }
     }
+    fn open_settings(&mut self, ctx: &egui::Context) {
+        self.show_settings = true;
+        let id = egui::ViewportId::from_hash_of("settings");
+        ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+    }
     fn settings_ui(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
-        let mut changed = false;
-        egui::Window::new("设置")
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.agents.windows_enabled,
-                        "采集 Windows 当前用户",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.agents.wsl_running_enabled,
-                        "发现运行中的 WSL2",
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.agents.wsl_default_user,
-                        "采集 WSL 默认用户",
-                    )
-                    .changed();
-                changed |= ui
-                    .add(egui::Slider::new(&mut self.settings.brightness, 1..=10).text("亮度"))
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut self.settings.rotate, "LCD 旋转 180°")
-                    .changed();
-                #[cfg(windows)]
-                {
-                    changed |= ui
-                        .checkbox(
-                            &mut self.settings.follow_system_display,
-                            "跟随系统熄屏/亮屏",
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("settings"),
+            egui::ViewportBuilder::default()
+                .with_title("设置")
+                .with_inner_size([520.0, 320.0])
+                .with_min_inner_size([360.0, 260.0]),
+            |ctx, class| {
+                if class == egui::ViewportClass::Embedded {
+                    egui::Window::new("设置").open(&mut open).show(ctx, |ui| {
+                        self.settings_controls(ui);
+                    });
+                } else if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                } else {
+                    let style = ctx.style();
+                    egui::CentralPanel::default()
+                        .frame(
+                            egui::Frame::new()
+                                .fill(style.visuals.window_fill())
+                                .inner_margin(style.spacing.window_margin),
                         )
-                        .changed();
+                        .show(ctx, |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                self.settings_controls(ui);
+                            });
+                        });
                 }
-                changed |= ui
-                    .checkbox(
-                        &mut self.settings.night_enabled,
-                        "夜间熄屏（本机预览继续运行）",
-                    )
-                    .changed();
-                ui.horizontal(|ui| {
-                    ui.label("熄屏时间");
-                    changed |= minute_editor(ui, &mut self.settings.night_start);
-                    ui.label("到");
-                    changed |= minute_editor(ui, &mut self.settings.night_end);
-                });
-                #[cfg(windows)]
-                {
-                    let mut enabled = autostart_enabled();
-                    if ui
-                        .checkbox(&mut enabled, "登录 Windows 后启动到托盘")
-                        .changed()
-                        && let Err(e) = set_autostart(enabled)
-                    {
-                        self.error = e.to_string();
-                    }
-                }
-                ui.separator();
-                ui.label("CPU 温度：运行 LibreHardwareMonitor 并启用 WMI。");
-                ui.label("额度来自 Codex 本地日志；Cursor 不提供 Token 用量。");
-                ui.label(format!("配置文件：{}", self.settings_path.display()));
-            });
+            },
+        );
         self.show_settings = open;
+    }
+    fn settings_controls(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        changed |= ui
+            .checkbox(
+                &mut self.settings.agents.windows_enabled,
+                "采集 Windows 当前用户",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.agents.wsl_running_enabled,
+                "发现运行中的 WSL2",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.agents.wsl_default_user,
+                "采集 WSL 默认用户",
+            )
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.settings.brightness, 1..=10).text("亮度"))
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.rotate, "LCD 旋转 180°")
+            .changed();
+        #[cfg(windows)]
+        {
+            changed |= ui
+                .checkbox(
+                    &mut self.settings.follow_system_display,
+                    "跟随系统熄屏/亮屏",
+                )
+                .changed();
+        }
+        changed |= ui
+            .checkbox(
+                &mut self.settings.night_enabled,
+                "夜间熄屏（本机预览继续运行）",
+            )
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("熄屏时间");
+            changed |= minute_editor(ui, &mut self.settings.night_start);
+            ui.label("到");
+            changed |= minute_editor(ui, &mut self.settings.night_end);
+        });
+        #[cfg(windows)]
+        {
+            let mut enabled = autostart_enabled();
+            if ui
+                .checkbox(&mut enabled, "登录 Windows 后启动到托盘")
+                .changed()
+                && let Err(e) = set_autostart(enabled)
+            {
+                self.error = e.to_string();
+            }
+        }
+        ui.separator();
+        ui.label("CPU 温度：运行 LibreHardwareMonitor 并启用 WMI。");
+        ui.label("额度来自 Codex 本地日志；Cursor 不提供 Token 用量。");
+        ui.label("配置文件：");
+        ui.label(self.settings_path.display().to_string());
         if changed {
             self.save();
         }
@@ -765,10 +800,12 @@ impl eframe::App for Dashboard {
             for request in requests {
                 match request.action {
                     preview::UiRequest::Preview => {}
-                    preview::UiRequest::Settings => self.show_settings = true,
+                    preview::UiRequest::Settings => self.open_settings(ctx),
                 }
                 if let Some(target) = self.repaint_target.lock().unwrap().clone() {
-                    target.window.restore(true);
+                    target
+                        .window
+                        .restore(matches!(request.action, preview::UiRequest::Preview));
                 }
                 self.command(preview::ClientCommand::HandledRequest(request.id));
             }
@@ -806,7 +843,7 @@ impl eframe::App for Dashboard {
             ui.horizontal(|ui| {
                 ui.strong(APP_NAME);
                 if ui.button("设置").clicked() {
-                    self.show_settings = true;
+                    self.open_settings(ctx);
                 }
                 if self.can_hide() && ui.button("隐藏到托盘").clicked() {
                     self.close_preview(ctx);
@@ -1125,12 +1162,12 @@ impl NativeWindow {
             if IsWindow(hwnd) == 0 {
                 return;
             }
-            let show = if IsIconic(hwnd) != 0 {
-                SW_RESTORE
-            } else if focus {
-                SW_SHOW
-            } else {
+            let show = if !focus {
                 SW_SHOWNOACTIVATE
+            } else if IsIconic(hwnd) != 0 {
+                SW_RESTORE
+            } else {
+                SW_SHOW
             };
             ShowWindow(hwnd, show);
             if focus {
@@ -1186,6 +1223,89 @@ fn display_time(timestamp: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_settings_close_reopen_and_hide_follow_preview_lifecycle() {
+        use std::{cell::Cell, rc::Rc};
+
+        let runtime = UiState {
+            settings_path: PathBuf::from("settings.json"),
+            shared_settings: Arc::default(),
+            agents: Arc::default(),
+            view: Arc::default(),
+            output: Arc::default(),
+            shutdown: Arc::default(),
+            repaint_target: Arc::default(),
+            error: Arc::default(),
+            #[cfg(windows)]
+            settings_epoch: Arc::default(),
+            can_hide: true,
+            #[cfg(windows)]
+            requests: Arc::default(),
+        };
+        let mut dashboard = Dashboard::new(&runtime, Settings::default(), true);
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let close_requested = Rc::new(Cell::new(false));
+        let child_close_requested = close_requested.clone();
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            let mut input = egui::RawInput {
+                viewport_id: viewport.ids.this,
+                ..Default::default()
+            };
+            let info = input.viewports.entry(viewport.ids.this).or_default();
+            info.parent = Some(viewport.ids.parent);
+            if child_close_requested.get() {
+                info.events.push(egui::ViewportEvent::Close);
+            }
+            let _ = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+        });
+        let id = egui::ViewportId::from_hash_of("settings");
+        let output = ctx.run(Default::default(), |ctx| dashboard.settings_ui(ctx));
+        assert_eq!(output.viewport_output[&id].parent, egui::ViewportId::ROOT);
+        assert_eq!(
+            output.viewport_output[&id].builder.title.as_deref(),
+            Some("设置")
+        );
+        assert!(dashboard.show_settings);
+
+        close_requested.set(true);
+        let output = ctx.run(Default::default(), |ctx| dashboard.settings_ui(ctx));
+        assert!(!dashboard.show_settings);
+        assert!(
+            !output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        let output = ctx.run(Default::default(), |_| {});
+        assert!(!output.viewport_output.contains_key(&id));
+
+        close_requested.set(false);
+        let output = ctx.run(Default::default(), |ctx| {
+            dashboard.open_settings(ctx);
+            dashboard.settings_ui(ctx);
+        });
+        assert!(dashboard.show_settings);
+        assert!(
+            output.viewport_output[&id]
+                .commands
+                .contains(&egui::ViewportCommand::Focus)
+        );
+        assert!(
+            output.viewport_output[&id]
+                .commands
+                .contains(&egui::ViewportCommand::Minimized(false))
+        );
+
+        let output = ctx.run(Default::default(), |ctx| dashboard.close_preview(ctx));
+        assert!(!dashboard.show_settings);
+        assert!(!output.viewport_output.contains_key(&id));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+    }
 
     #[test]
     fn preview_uploads_each_sequence_once_and_reopens_with_latest_frame() {

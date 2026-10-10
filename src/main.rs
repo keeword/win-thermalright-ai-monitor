@@ -1,4 +1,4 @@
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod agents;
 mod app;
@@ -78,7 +78,7 @@ pub struct Args {
 }
 
 fn main() {
-    #[cfg(all(windows, not(debug_assertions)))]
+    #[cfg(windows)]
     let headless = std::env::args().any(|arg| {
         matches!(
             arg.as_str(),
@@ -90,11 +90,11 @@ fn main() {
                 | "--preview-client"
         )
     });
-    #[cfg(all(windows, not(debug_assertions)))]
+    #[cfg(windows)]
     let console = attach_parent_console();
     if let Err(error) = execute() {
         eprintln!("{error:#}");
-        #[cfg(all(windows, not(debug_assertions)))]
+        #[cfg(windows)]
         if !console && !headless {
             let title: Vec<u16> = APP_NAME.encode_utf16().chain(Some(0)).collect();
             let message: Vec<u16> = format!("{error:#}").encode_utf16().chain(Some(0)).collect();
@@ -112,7 +112,7 @@ fn main() {
     }
 }
 
-#[cfg(all(windows, not(debug_assertions)))]
+#[cfg(windows)]
 fn attach_parent_console() -> bool {
     use windows_sys::Win32::{
         Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType},

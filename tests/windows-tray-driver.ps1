@@ -1,6 +1,6 @@
 param(
   [int]$MonitorPid,
-  [ValidateSet('Inspect','Preview','Settings','Close','CloseThenSettings','Quit','Minimize','Suspend')][string]$Action='Inspect',
+  [ValidateSet('Inspect','Preview','Settings','Close','CloseSettings','CloseThenSettings','Quit','Minimize','Suspend')][string]$Action='Inspect',
   [string]$Capture,
   [switch]$NoWait,
   [int]$TimeoutSeconds=15
@@ -79,6 +79,7 @@ $windows=[MonitorWindows]::List($MonitorPid)
 if ($Action -ne 'Inspect') {
   $trayWindow=$windows | Where-Object Class -eq 'tray_icon_app' | Select-Object -First 1
   $mainWindow=$windows | Where-Object Title -eq 'win-thermalright-ai-monitor' | Select-Object -First 1
+  $settingsWindow=$windows | Where-Object Title -eq '设置' | Select-Object -First 1
   function Send-WindowMessage($window, [uint32]$message, [uint64]$command) {
     if (-not $window) { throw "No target window for $Action (monitor PID $MonitorPid)." }
     [UIntPtr]$result=[UIntPtr]::Zero
@@ -91,6 +92,7 @@ if ($Action -ne 'Inspect') {
     'Settings' { Send-WindowMessage $trayWindow 0x111 1002 }
     'Quit' { Send-WindowMessage $trayWindow 0x111 1003 }
     'Close' { Send-WindowMessage $mainWindow 0x10 0 }
+    'CloseSettings' { Send-WindowMessage $settingsWindow 0x10 0 }
     'CloseThenSettings' {
       # Deliberately avoid waiting for the closing child before the tray request.
       Send-WindowMessage $mainWindow 0x10 0
@@ -107,12 +109,15 @@ if ($Action -ne 'Inspect') {
     do {
       $current=[MonitorWindows]::List($MonitorPid)
       $preview=$current | Where-Object Title -eq 'win-thermalright-ai-monitor' | Select-Object -First 1
+      $settings=@($current | Where-Object Title -eq '设置')
       $ready=switch ($Action) {
-        'Close' { -not $preview }
+        'Close' { -not $preview -and $settings.Count -eq 0 }
+        'CloseSettings' { $preview -and $preview.Visible -and $settings.Count -eq 0 }
+        'Settings' { $preview -and $preview.Visible -and -not $preview.Minimized -and $settings.Count -eq 1 -and $settings[0].Visible -and -not $settings[0].Minimized }
         'Quit' { -not $current }
         'Minimize' { $preview -and $preview.Minimized }
         'Suspend' { $preview }
-        'CloseThenSettings' { $preview -and $preview.Pid -ne $mainWindow.Pid -and $preview.Visible -and -not $preview.Minimized }
+        'CloseThenSettings' { $preview -and $preview.Pid -ne $mainWindow.Pid -and $preview.Visible -and -not $preview.Minimized -and $settings.Count -eq 1 -and $settings[0].Visible }
         default { $preview -and $preview.Visible -and -not $preview.Minimized }
       }
       if ($ready) { break }
