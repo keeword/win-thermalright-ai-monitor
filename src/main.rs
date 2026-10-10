@@ -5,7 +5,6 @@ mod app;
 mod config;
 mod metrics;
 mod monitor;
-#[cfg(windows)]
 mod power;
 mod probe;
 mod protocol;

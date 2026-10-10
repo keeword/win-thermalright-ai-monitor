@@ -163,11 +163,11 @@ impl Dashboard {
         let shared_settings = Arc::new(Mutex::new(settings.clone()));
         let agents = Arc::new(Mutex::new(AgentSnapshot::default()));
         let view = Arc::new(Mutex::new(ViewState::default()));
-        let system_off = Arc::new(AtomicBool::new(false));
+        let display_state = Arc::new(crate::power::DisplayState::default());
         #[cfg(windows)]
-        let (display_power, power_error) = match NativeWindow::from_context(cc)
-            .and_then(|window| crate::power::DisplayPower::new(window.0 as _, system_off.clone()))
-        {
+        let (display_power, power_error) = match NativeWindow::from_context(cc).and_then(|window| {
+            crate::power::DisplayPower::new(window.0 as _, display_state.clone())
+        }) {
             Ok(monitor) => (Some(monitor), String::new()),
             Err(e) => (None, format!("Display power sync unavailable: {e:#}")),
         };
@@ -231,9 +231,24 @@ impl Dashboard {
                 let start = Instant::now();
                 let mut frames = 0;
                 let mut fps_start = Instant::now();
+                let mut generation = display_state.generation.load(Ordering::Relaxed);
                 while !stop.load(Ordering::Relaxed) {
                     let tick = Instant::now();
-                    if lcd.is_none() && tick >= retry {
+                    let suspended = display_state.suspended.load(Ordering::Relaxed);
+                    let current_generation = display_state.generation.load(Ordering::Relaxed);
+                    if suspended || current_generation != generation {
+                        lcd = None;
+                        retry = tick;
+                        generation = current_generation;
+                        let mut state = output.lock().unwrap();
+                        state.connected = false;
+                        state.status = if suspended {
+                            "System sleeping; LCD paused".into()
+                        } else {
+                            "System awake; reconnecting LCD".into()
+                        };
+                    }
+                    if !suspended && lcd.is_none() && tick >= retry {
                         match Lcd::open() {
                             Ok(device) => {
                                 let mut state = output.lock().unwrap();
@@ -247,7 +262,7 @@ impl Dashboard {
                             Err(e) => {
                                 let mut state = output.lock().unwrap();
                                 state.connected = false;
-                                state.status = e.to_string();
+                                state.status = format!("{e:#}");
                             }
                         }
                         retry = tick + Duration::from_secs(3);
@@ -257,8 +272,9 @@ impl Dashboard {
                     snapshot.agents = agents.lock().unwrap().clone();
                     let night = settings.is_night();
 
-                    let off = settings.follow_system_display && system_off.load(Ordering::Relaxed);
-                    let blank = night || off;
+                    let off =
+                        settings.follow_system_display && display_state.off.load(Ordering::Relaxed);
+                    let blank = night || off || suspended;
                     let current_view = {
                         let mut view = view.lock().unwrap();
                         view.sync(&snapshot.agents, &settings.agent_view, tick, blank);
@@ -284,7 +300,7 @@ impl Dashboard {
                         if let Err(e) = device.send(send_frame, &settings) {
                             let mut state = output.lock().unwrap();
                             state.connected = false;
-                            state.status = format!("USB disconnected: {e}");
+                            state.status = format!("USB disconnected: {e:#}");
                             lcd = None;
                             retry = Instant::now() + Duration::from_secs(3);
                         }
@@ -315,10 +331,12 @@ impl Dashboard {
                         &stop,
                         interval.saturating_sub(tick.elapsed()),
                         || {
-                            shared_settings.lock().unwrap().follow_system_display
-                                == settings.follow_system_display
+                            display_state.generation.load(Ordering::Relaxed) == generation
+                                && display_state.suspended.load(Ordering::Relaxed) == suspended
+                                && shared_settings.lock().unwrap().follow_system_display
+                                    == settings.follow_system_display
                                 && (!settings.follow_system_display
-                                    || system_off.load(Ordering::Relaxed) == off)
+                                    || display_state.off.load(Ordering::Relaxed) == off)
                         },
                     );
                 }
@@ -916,21 +934,27 @@ mod tests {
 
     #[test]
     fn display_power_changes_interrupt_the_frame_interval() {
-        for initially_off in [false, true] {
-            let off = Arc::new(AtomicBool::new(initially_off));
-            let worker_off = off.clone();
+        for (initially_off, resume) in [(false, false), (true, false), (true, true)] {
+            let state = Arc::new(crate::power::DisplayState::default());
+            state.off.store(initially_off, Ordering::Relaxed);
+            let worker_state = state.clone();
             let (started_tx, started_rx) = std::sync::mpsc::channel();
             let (finished_tx, finished_rx) = std::sync::mpsc::channel();
             let worker = thread::spawn(move || {
                 let stop = AtomicBool::new(false);
                 started_tx.send(()).unwrap();
                 interruptible_sleep_while(&stop, Duration::from_secs(3), || {
-                    worker_off.load(Ordering::Relaxed) == initially_off
+                    worker_state.off.load(Ordering::Relaxed) == initially_off
+                        && worker_state.generation.load(Ordering::Relaxed) == 0
                 });
                 finished_tx.send(()).unwrap();
             });
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            off.store(!initially_off, Ordering::Relaxed);
+            if resume {
+                state.generation.fetch_add(1, Ordering::Relaxed);
+            } else {
+                state.off.store(!initially_off, Ordering::Relaxed);
+            }
             let result = finished_rx.recv_timeout(Duration::from_millis(500));
             worker.join().unwrap();
             result.expect("LCD should respond without waiting for the three-second black interval");

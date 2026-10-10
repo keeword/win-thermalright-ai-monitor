@@ -1,8 +1,9 @@
+#[cfg(windows)]
 use anyhow::{Context, Result};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+#[cfg(windows)]
+use std::sync::{Arc, atomic::Ordering};
+#[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::{
@@ -15,27 +16,39 @@ use windows_sys::Win32::{
     UI::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            DEVICE_NOTIFY_WINDOW_HANDLE, PBT_POWERSETTINGCHANGE, WM_NCDESTROY, WM_POWERBROADCAST,
+            DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL,
+            PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, WM_NCDESTROY,
+            WM_POWERBROADCAST,
         },
     },
 };
 
+#[derive(Default)]
+pub struct DisplayState {
+    pub off: AtomicBool,
+    pub suspended: AtomicBool,
+    pub generation: AtomicUsize,
+}
+
+#[cfg(windows)]
 const SUBCLASS_ID: usize = 0x54484d50;
 
 /// Owned by the UI thread, like the preview HWND. Notifications also arrive
 /// while the window is hidden; the USB worker reads the shared state directly.
+#[cfg(windows)]
 pub struct DisplayPower {
     window: HWND,
     notification: HPOWERNOTIFY,
-    off: Arc<AtomicBool>,
+    state: Arc<DisplayState>,
 }
 
+#[cfg(windows)]
 impl DisplayPower {
-    pub fn new(window: HWND, off: Arc<AtomicBool>) -> Result<Self> {
+    pub fn new(window: HWND, state: Arc<DisplayState>) -> Result<Self> {
         let mut monitor = Self {
             window,
             notification: 0,
-            off,
+            state,
         };
         // The Arc allocation stays alive until Drop has removed the subclass.
         let installed = unsafe {
@@ -43,7 +56,7 @@ impl DisplayPower {
                 window,
                 Some(power_callback),
                 SUBCLASS_ID,
-                Arc::as_ptr(&monitor.off) as usize,
+                Arc::as_ptr(&monitor.state) as usize,
             )
         };
         if installed == 0 {
@@ -67,6 +80,7 @@ impl DisplayPower {
     }
 }
 
+#[cfg(windows)]
 impl Drop for DisplayPower {
     fn drop(&mut self) {
         unsafe {
@@ -78,6 +92,7 @@ impl Drop for DisplayPower {
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn power_callback(
     window: HWND,
     message: u32,
@@ -86,7 +101,26 @@ unsafe extern "system" fn power_callback(
     subclass_id: usize,
     data: usize,
 ) -> LRESULT {
-    if message == WM_POWERBROADCAST && wparam == PBT_POWERSETTINGCHANGE as usize && lparam != 0 {
+    let state = unsafe { &*(data as *const DisplayState) };
+    if message == WM_POWERBROADCAST && wparam == PBT_APMSUSPEND as usize {
+        state.suspended.store(true, Ordering::Relaxed);
+    } else if message == WM_POWERBROADCAST
+        && matches!(
+            wparam as u32,
+            PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL
+        )
+    {
+        // Automatic wake may be unattended; only an interactive resume clears
+        // a stale off state. Every resume invalidates the old USB connection.
+        if wparam != PBT_APMRESUMEAUTOMATIC as usize {
+            state.off.store(false, Ordering::Relaxed);
+        }
+        state.suspended.store(false, Ordering::Relaxed);
+        state.generation.fetch_add(1, Ordering::Relaxed);
+    } else if message == WM_POWERBROADCAST
+        && wparam == PBT_POWERSETTINGCHANGE as usize
+        && lparam != 0
+    {
         // Windows owns this variable-length payload for the duration of the
         // callback. Read the DWORD only after checking its advertised length.
         let setting = lparam as *const POWERBROADCAST_SETTING;
@@ -104,9 +138,8 @@ unsafe extern "system" fn power_callback(
                     .read_unaligned()
             };
             // 0 = off, 1 = on, 2 = dimmed. Dimming keeps the LCD running.
-            if value <= 2 {
-                let off = unsafe { &*(data as *const AtomicBool) };
-                off.store(value == 0, Ordering::Relaxed);
+            if value <= 2 && state.off.swap(value == 0, Ordering::Relaxed) && value != 0 {
+                state.generation.fetch_add(1, Ordering::Relaxed);
             }
         }
     } else if message == WM_NCDESTROY {
@@ -115,7 +148,7 @@ unsafe extern "system" fn power_callback(
     unsafe { DefSubclassProc(window, message, wparam, lparam) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use windows_sys::{
@@ -175,8 +208,9 @@ mod tests {
         });
         assert!(!window.0.is_null());
         assert_eq!(unsafe { IsWindowVisible(window.0) }, 0);
-        let off = Arc::new(AtomicBool::new(false));
-        let monitor = DisplayPower::new(window.0, off.clone()).unwrap();
+        let state = Arc::new(DisplayState::default());
+        let off = &state.off;
+        let monitor = DisplayPower::new(window.0, state.clone()).unwrap();
 
         for (value, expected) in [(0, true), (1, false), (0, true), (2, false)] {
             notify(window.0, GUID_CONSOLE_DISPLAY_STATE, 4, value);
@@ -198,6 +232,42 @@ mod tests {
             )
         };
         assert!(off.load(Ordering::Relaxed));
+
+        let generation = state.generation.load(Ordering::Relaxed);
+        unsafe { SendMessageW(window.0, WM_POWERBROADCAST, PBT_APMSUSPEND as usize, 0) };
+        assert!(state.suspended.load(Ordering::Relaxed));
+        unsafe {
+            SendMessageW(
+                window.0,
+                WM_POWERBROADCAST,
+                PBT_APMRESUMEAUTOMATIC as usize,
+                0,
+            )
+        };
+        assert!(!state.suspended.load(Ordering::Relaxed));
+        assert!(
+            off.load(Ordering::Relaxed),
+            "unattended wake must keep the display off"
+        );
+        assert_eq!(state.generation.load(Ordering::Relaxed), generation + 1);
+        unsafe {
+            SendMessageW(
+                window.0,
+                WM_POWERBROADCAST,
+                PBT_APMRESUMESUSPEND as usize,
+                0,
+            )
+        };
+        assert!(
+            !off.load(Ordering::Relaxed),
+            "interactive resume must clear stale off state"
+        );
+        assert_eq!(state.generation.load(Ordering::Relaxed), generation + 2);
+        // Off/on between worker ticks still invalidates the previous handle.
+        notify(window.0, GUID_CONSOLE_DISPLAY_STATE, 4, 0);
+        notify(window.0, GUID_CONSOLE_DISPLAY_STATE, 4, 1);
+        assert_eq!(state.generation.load(Ordering::Relaxed), generation + 3);
+        notify(window.0, GUID_CONSOLE_DISPLAY_STATE, 4, 0);
 
         drop(monitor);
         notify(window.0, GUID_CONSOLE_DISPLAY_STATE, 4, 1);

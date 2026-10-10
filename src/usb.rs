@@ -68,14 +68,26 @@ impl Lcd {
                             height: 480,
                         },
                     };
-                    let mut init = [0; 2048];
-                    init[..16].copy_from_slice(&protocol::HANDSHAKE_HEADER);
-                    lcd.write(&init)?;
-                    let mut response = [0; 512];
-                    let n =
-                        lcd.handle
-                            .read_bulk(lcd.ep_in, &mut response, Duration::from_secs(1))?;
-                    lcd.info = protocol::parse_handshake(&response[..n], lcd.pid)?;
+                    lcd.info = match lcd.handshake() {
+                        Ok(info) => info,
+                        Err(first) => {
+                            // Reopening a WinUSB handle does not reset its pipes.
+                            // Sleep or a partial frame can leave queued replies
+                            // and a stalled endpoint behind on the next open.
+                            lcd.handle.reset().with_context(|| {
+                                format!("Resetting LCD USB after handshake failed: {first:#}")
+                            })?;
+                            lcd.handle
+                                .clear_halt(lcd.ep_out)
+                                .context("Clearing LCD output pipe")?;
+                            lcd.handle
+                                .clear_halt(lcd.ep_in)
+                                .context("Clearing LCD input pipe")?;
+                            lcd.handshake().with_context(|| {
+                                format!("LCD handshake still failed after USB recovery (first error: {first:#})")
+                            })?
+                        }
+                    };
                     return Ok(lcd);
                 }
             }
@@ -86,9 +98,20 @@ impl Lcd {
     fn write(&self, bytes: &[u8]) -> Result<()> {
         let n = self
             .handle
-            .write_bulk(self.ep_out, bytes, Duration::from_secs(2))?;
+            .write_bulk(self.ep_out, bytes, Duration::from_secs(2))
+            .context("Writing LCD USB data")?;
         ensure!(n == bytes.len(), "Short USB transfer: {n}/{}", bytes.len());
         Ok(())
+    }
+    fn handshake(&self) -> Result<DeviceInfo> {
+        let mut init = [0; 2048];
+        init[..16].copy_from_slice(&protocol::HANDSHAKE_HEADER);
+        self.write(&init).context("Sending LCD handshake")?;
+        read_handshake(self.pid, |response, timeout| {
+            self.handle
+                .read_bulk(self.ep_in, response, timeout)
+                .context("Reading LCD handshake response")
+        })
     }
     pub fn send(&mut self, frame: &RgbaImage, settings: &Settings) -> Result<()> {
         let mut frame = image::imageops::resize(
@@ -123,14 +146,83 @@ impl Lcd {
         let mut ack = [0; 512];
         let n = self
             .handle
-            .read_bulk(self.ep_in, &mut ack, Duration::from_secs(1))?;
+            .read_bulk(self.ep_in, &mut ack, Duration::from_secs(1))
+            .context("Waiting for LCD frame acknowledgement")?;
         ensure!(n > 0, "Empty LCD acknowledgement");
         Ok(())
     }
 }
 
+fn read_handshake(
+    pid: u16,
+    mut read: impl FnMut(&mut [u8], Duration) -> Result<usize>,
+) -> Result<DeviceInfo> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut response = [0; 512];
+    // A late frame ACK from before sleep must not be mistaken for the new
+    // handshake. Bound both the duration and the number of unrelated replies.
+    for _ in 0..16 {
+        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+        ensure!(!timeout.is_zero(), "LCD handshake response timed out");
+        let n = read(&mut response, timeout)?;
+        if n >= 37 && response[0] == 3 && response[1] == 255 && response[8] == 1 {
+            return protocol::parse_handshake(&response[..n], pid);
+        }
+    }
+    anyhow::bail!("LCD sent too many unrelated replies while waiting for handshake")
+}
+
 impl Drop for Lcd {
     fn drop(&mut self) {
         let _ = self.handle.release_interface(self.interface);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(profile: u8) -> [u8; 512] {
+        let mut response = [0; 512];
+        response[0] = 3;
+        response[1] = 255;
+        response[8] = 1;
+        response[20] = profile;
+        response
+    }
+
+    #[test]
+    fn handshake_skips_late_frame_acknowledgement() {
+        let mut replies = [vec![1, 255, 0, 0], response(1).to_vec()].into_iter();
+        let info = read_handshake(0x5408, |buffer, timeout| {
+            assert!(!timeout.is_zero() && timeout <= Duration::from_secs(1));
+            let reply = replies.next().unwrap();
+            buffer[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        })
+        .unwrap();
+        assert_eq!((info.pm, info.width, info.height), (65, 1920, 480));
+        assert!(replies.next().is_none());
+    }
+
+    #[test]
+    fn handshake_preserves_timeout_and_unsupported_profile_errors() {
+        let error = read_handshake(0x5408, |_, _| Err(rusb::Error::Timeout.into())).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<rusb::Error>(),
+            Some(&rusb::Error::Timeout)
+        );
+        let error = read_handshake(0x5408, |buffer, _| {
+            buffer.copy_from_slice(&response(255));
+            Ok(buffer.len())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("Unsupported LCD profile"));
+    }
+
+    #[test]
+    fn handshake_bounds_unrelated_replies() {
+        let error = read_handshake(0x5408, |_, _| Ok(0)).unwrap_err();
+        assert!(error.to_string().contains("too many unrelated replies"));
     }
 }
