@@ -75,6 +75,37 @@ struct CachedGlyph {
     glyph: RasterGlyph,
     last_used: u64,
 }
+
+fn load_font(path: &Path) -> Result<FontArc> {
+    let bytes = crate::fonts::bytes(path).with_context(|| {
+        format!(
+            "Cannot read font {}; configure a Chinese-capable TTF/TTC via settings.font",
+            path.display()
+        )
+    })?;
+    let font = FontRef::try_from_slice_and_index(bytes, 0)
+        .with_context(|| format!("Parsing font {}", path.display()))?;
+    anyhow::ensure!(
+        font.units_per_em().is_some(),
+        "Font has no em size: {}",
+        path.display()
+    );
+    Ok(FontArc::new(font))
+}
+
+fn load_fonts(main: &Path, auxiliary_directory: Option<&Path>) -> Result<Vec<FontArc>> {
+    // Main/default and explicitly configured fonts must remain valid. Optional
+    // weight/Latin fonts can fail independently without stopping LCD output.
+    let regular = load_font(main)?;
+    let mut fonts = vec![regular.clone()];
+    for name in ["msyhbd.ttc", "segoeui.ttf", "segoeuib.ttf"] {
+        let font = auxiliary_directory
+            .and_then(|directory| load_font(&directory.join(name)).ok())
+            .unwrap_or_else(|| regular.clone());
+        fonts.push(font);
+    }
+    Ok(fonts)
+}
 struct GlyphCache {
     entries: HashMap<GlyphKey, CachedGlyph>,
     bytes: usize,
@@ -111,11 +142,12 @@ impl GlyphCache {
                 return self.uncached.as_ref().unwrap();
             }
             while self.bytes + cost > self.budget || self.entries.len() >= GLYPH_CACHE_ENTRIES {
-                // Prefer retaining the Latin/digit glyphs used by fixed labels.
+                // Fixed labels stay recent through normal rendering; retaining
+                // stale ASCII keys would displace frequently reused CJK text.
                 let oldest = *self
                     .entries
                     .iter()
-                    .min_by_key(|(key, entry)| (key.0.is_ascii(), entry.last_used))
+                    .min_by_key(|(_, entry)| entry.last_used)
                     .unwrap()
                     .0;
                 let removed = self.entries.remove(&oldest).unwrap();
@@ -158,45 +190,12 @@ pub struct Renderer {
 }
 impl Renderer {
     pub fn new(font_path: Option<&Path>) -> Result<Self> {
-        let font_dir = std::env::var_os("WINDIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "C:/Windows".into())
-            .join("Fonts");
-        let default_path = font_dir.join("msyh.ttc");
+        let font_dir = crate::fonts::directory();
+        let default_path = crate::fonts::default_path();
         let path = font_path.unwrap_or(&default_path);
-        let load_font = |path: &Path| -> Result<FontArc> {
-            let bytes = crate::fonts::bytes(path).with_context(|| {
-                format!(
-                    "Cannot read font {}; configure a Chinese-capable TTF/TTC via settings.font",
-                    path.display()
-                )
-            })?;
-            let font = FontRef::try_from_slice_and_index(bytes, 0)
-                .with_context(|| format!("Parsing font {}", path.display()))?;
-            anyhow::ensure!(
-                font.units_per_em().is_some(),
-                "Font has no em size: {}",
-                path.display()
-            );
-            Ok(FontArc::new(font))
-        };
-        let regular = load_font(path)?;
         // Default Latin and Chinese fonts have real regular/bold weights. An
         // explicit custom font applies to both scripts and takes precedence.
-        let mut fonts = Vec::new();
-        for name in ["msyh.ttc", "msyhbd.ttc", "segoeui.ttf", "segoeuib.ttf"] {
-            let font = if font_path.is_none() && name != "msyh.ttc" {
-                let path = font_dir.join(name);
-                if path.exists() {
-                    load_font(&path)?
-                } else {
-                    regular.clone()
-                }
-            } else {
-                regular.clone()
-            };
-            fonts.push(font);
-        }
+        let fonts = load_fonts(path, font_path.is_none().then_some(font_dir.as_path()))?;
         Ok(Self {
             canvas: Pixmap::new(1920, 480).context("Allocating dashboard")?,
             fonts,
@@ -1052,8 +1051,100 @@ mod cache_tests {
         }
     }
 
+    // This measures two eviction policies with actual glyph rasterization and
+    // identical limits. Run explicitly; font/CPU timings are machine specific.
+    #[cfg(windows)]
     #[test]
-    fn cache_evicts_least_recently_used_glyph_and_prefers_fixed_labels() {
+    #[ignore = "manual glyph eviction benchmark"]
+    fn compare_ascii_priority_and_lru_under_label_and_cjk_churn() {
+        use std::time::Instant;
+        let renderer = Renderer::new(None).unwrap();
+        for corpus in [300u32, 3900] {
+            let mut trace = Vec::new();
+            // Old dynamic English text leaves these keys behind after the
+            // workload switches to CJK sessions. Sizes/weights occur in cards.
+            for size in [14, 16, 22, 26] {
+                for bold in [false, true] {
+                    for ch in 'a'..='z' {
+                        trace.push((ch, size, Renderer::font_index(ch, bold)));
+                    }
+                }
+            }
+            for frame in 0..120u32 {
+                for (label, size, bold) in [
+                    ("CPU AI SESSIONS", 24, true),
+                    ("Cores Temp", 26, false),
+                    ("0123456789 %", 26, true),
+                    ("已打开 工作中 待处理 待确认", 18, false),
+                    ("今日 Token 全部来源", 18, false),
+                ] {
+                    trace.extend(
+                        label
+                            .chars()
+                            .map(|ch| (ch, size, Renderer::font_index(ch, bold))),
+                    );
+                }
+                // Six overview cards expose rotating CJK message/project text.
+                for position in 0..200u32 {
+                    let ch = char::from_u32(0x4e00 + (frame * 200 + position) % corpus).unwrap();
+                    trace.push((ch, 19, 0));
+                }
+            }
+            for ascii_priority in [true, false] {
+                let started = Instant::now();
+                let mut cache = GlyphCache::new(GLYPH_CACHE_BYTES);
+                let mut misses = 0;
+                for &key in &trace {
+                    cache.clock += 1;
+                    if !cache.entries.contains_key(&key) {
+                        misses += 1;
+                        let glyph = RasterGlyph::new(&renderer.fonts[key.2], key.0, key.1);
+                        let cost = GlyphCache::cost(&glyph);
+                        assert!(cost <= cache.budget);
+                        while cache.bytes + cost > cache.budget
+                            || cache.entries.len() >= GLYPH_CACHE_ENTRIES
+                        {
+                            let oldest = *cache
+                                .entries
+                                .iter()
+                                .min_by_key(|(key, entry)| {
+                                    (ascii_priority && key.0.is_ascii(), entry.last_used)
+                                })
+                                .unwrap()
+                                .0;
+                            let removed = cache.entries.remove(&oldest).unwrap();
+                            cache.bytes -= GlyphCache::cost(&removed.glyph);
+                        }
+                        cache.bytes += cost;
+                        cache.entries.insert(
+                            key,
+                            CachedGlyph {
+                                glyph,
+                                last_used: cache.clock,
+                            },
+                        );
+                    }
+                    cache.entries.get_mut(&key).unwrap().last_used = cache.clock;
+                }
+                eprintln!(
+                    "corpus={corpus} policy={} references={} misses={misses} hit_rate={:.2}% elapsed_ms={} entries={} bytes={}",
+                    if ascii_priority {
+                        "ascii-priority"
+                    } else {
+                        "lru"
+                    },
+                    trace.len(),
+                    (trace.len() - misses) as f64 * 100.0 / trace.len() as f64,
+                    started.elapsed().as_millis(),
+                    cache.entries.len(),
+                    cache.bytes,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_glyph_regardless_of_script() {
         let cost = GlyphCache::cost(&glyph(16));
         let mut cache = GlyphCache::new(cost * 2);
         for ch in ['甲', '乙'] {
@@ -1069,6 +1160,15 @@ mod cache_tests {
         for ch in ['0', '甲', '乙'] {
             cache.get_or_insert_with((ch, 24, 0), || glyph(16));
         }
+        assert!(!cache.entries.contains_key(&('0', 24, 0)));
+        assert!(cache.entries.contains_key(&('甲', 24, 0)));
+
+        let mut cache = GlyphCache::new(cost * 2);
+        for ch in ['0', '甲'] {
+            cache.get_or_insert_with((ch, 24, 0), || glyph(16));
+        }
+        cache.get_or_insert_with(('0', 24, 0), || panic!("fixed label should stay cached"));
+        cache.get_or_insert_with(('乙', 24, 0), || glyph(16));
         assert!(cache.entries.contains_key(&('0', 24, 0)));
         assert!(!cache.entries.contains_key(&('甲', 24, 0)));
     }
@@ -1105,6 +1205,30 @@ mod cache_tests {
 
     #[cfg(windows)]
     #[test]
+    fn optional_fonts_fall_back_for_missing_unreadable_and_invalid_files() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("msyhbd.ttc"), b"invalid font").unwrap();
+        let inaccessible = directory.path().join("segoeui.ttf");
+        std::fs::write(&inaccessible, b"font bytes").unwrap();
+        let _exclusive = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&inaccessible)
+            .unwrap();
+        // segoeuib.ttf is missing. All three failures should reuse the valid
+        // regular font, without weakening errors for a configured main font.
+        let fonts = load_fonts(&crate::fonts::default_path(), Some(directory.path())).unwrap();
+        for font in &fonts[1..] {
+            assert_eq!(font.font_data().as_ptr(), fonts[0].font_data().as_ptr());
+        }
+        assert!(Renderer::new(Some(&directory.path().join("msyhbd.ttc"))).is_err());
+        assert!(Renderer::new(Some(&inaccessible)).is_err());
+        assert!(Renderer::new(Some(&directory.path().join("missing.ttf"))).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn chinese_and_latin_fonts_preserve_em_size_and_baseline() {
         let renderer = Renderer::new(None).unwrap();
         for (ch, font_index) in [('中', 0), ('国', 1), ('A', 2), ('g', 3), (' ', 2)] {
@@ -1128,10 +1252,7 @@ mod cache_tests {
                 assert!((raster.advance - 24.0).abs() < 0.001);
             }
         }
-        let font_path = std::env::var_os("WINDIR")
-            .map(std::path::PathBuf::from)
-            .unwrap()
-            .join("Fonts/msyh.ttc");
+        let font_path = crate::fonts::default_path();
         let custom = Renderer::new(Some(&font_path)).unwrap();
         let bytes = crate::fonts::bytes(&font_path).unwrap();
         for font in &custom.fonts {

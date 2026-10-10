@@ -660,15 +660,6 @@ pub struct DailyUsage {
     pub input: u64,
     pub output: u64,
     pub coverage: String,
-    #[serde(default)]
-    pub by_origin: Vec<OriginUsage>,
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-pub struct OriginUsage {
-    pub origin_id: String,
-    pub agent_kind: Option<AgentKind>,
-    pub input: u64,
-    pub output: u64,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AgentSnapshot {
@@ -676,7 +667,6 @@ pub struct AgentSnapshot {
     pub instances: Vec<LiveInstance>,
     pub origins: Vec<Origin>,
     pub daily_usage: DailyUsage,
-    pub revision: u64,
     pub origins_ready: bool,
 }
 impl AgentSnapshot {
@@ -1127,7 +1117,6 @@ impl Merger {
         self.snapshot
             .sessions
             .retain(|s| s.open_state != OpenState::Closed);
-        self.snapshot.revision += 1;
     }
 }
 

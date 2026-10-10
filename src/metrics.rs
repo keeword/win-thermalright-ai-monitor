@@ -2,7 +2,6 @@ use crate::agents::{AgentKind, Plan, Usage};
 use crate::session::{
     AgentSession, AgentSnapshot, DailyUsage, OpenState, Origin, SessionKey, WorkState,
 };
-use std::path::PathBuf;
 use sysinfo::{
     Components, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
 };
@@ -106,7 +105,6 @@ impl Snapshot {
             input: 12480000,
             output: 186400,
             coverage: "演示数据".into(),
-            by_origin: vec![],
         };
         Self {
             cpu,
@@ -133,7 +131,7 @@ pub struct Metrics {
     tick: u64,
 }
 impl Metrics {
-    pub fn new(_home: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
             system: System::new_with_specifics(
                 RefreshKind::nothing()

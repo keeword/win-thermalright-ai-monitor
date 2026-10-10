@@ -66,7 +66,6 @@ struct Session {
     session_id: String,
     cumulative: (u64, u64),
     tokens: HashMap<String, (u64, u64)>,
-    quota_time: String,
     attention_since: Option<SystemTime>,
     subagent: bool,
     kind: Option<AgentKind>,
@@ -134,9 +133,6 @@ impl Collector {
                     AgentKind::Cursor => ".cursor/projects",
                 })
             });
-            let mut latest: Option<(SystemTime, Usage, String)> = None;
-            let mut daily: HashMap<String, (u64, u64)> = HashMap::new();
-            let mut quota: Option<(String, Option<f64>, Option<i64>)> = None;
             let mut files = Vec::new();
             let root = root.canonicalize().unwrap_or(root);
             let mut roots = vec![root.clone()];
@@ -275,18 +271,6 @@ impl Collector {
                 }
                 for (id, tokens) in &session.tokens {
                     result.events.push((kind, id.clone(), *tokens));
-                    let target = daily.entry(id.clone()).or_default();
-                    target.0 = target.0.max(tokens.0);
-                    target.1 = target.1.max(tokens.1);
-                }
-                if session.usage.quota_used.is_some()
-                    && quota.as_ref().is_none_or(|q| session.quota_time > q.0)
-                {
-                    quota = Some((
-                        session.quota_time.clone(),
-                        session.usage.quota_used,
-                        session.usage.quota_reset,
-                    ));
                 }
                 // Internal review/spawned agents are counted for usage, but must
                 // never replace the project/message shown for a user's main agent.
@@ -335,38 +319,14 @@ impl Collector {
                     if kind == AgentKind::Cursor {
                         cursor_details(&self.home, &sid, &mut usage);
                     }
-                    result.sessions.push((kind, usage.clone()));
-                    if latest.as_ref().is_none_or(|v| active_at > v.0) {
-                        latest = Some((active_at, usage, sid));
-                    }
+                    result.sessions.push((kind, usage));
                 }
             }
-            let (mut usage, sid) = latest.map(|(_, u, s)| (u, s)).unwrap_or_default();
-            usage.input = 0;
-            usage.output = 0;
-            usage.available = root.exists();
-            for (input, output) in daily.values() {
-                usage.input = usage.input.saturating_add(*input);
-                usage.output = usage.output.saturating_add(*output);
-            }
-            if let Some((_, used, reset)) = quota {
-                usage.quota_used = used;
-                usage.quota_reset = reset;
-            }
-            if kind == AgentKind::Cursor {
-                cursor_details(&self.home, &sid, &mut usage);
-            }
-            result.legacy.insert(kind, usage);
         }
         self.sessions.retain(|p, _| present.contains(p));
         self.stamps.retain(|p, _| discovered.contains(p));
         result
     }
-    #[cfg(test)]
-    pub fn collect(&mut self) -> HashMap<AgentKind, Usage> {
-        self.collect_logs(&[]).legacy
-    }
-
     pub fn offsets(&mut self) -> HashMap<String, (String, u64)> {
         let day = Local::now().date_naive();
         if self.day != day {
@@ -505,7 +465,6 @@ pub struct LogSnapshot {
     pub events: Vec<(AgentKind, String, (u64, u64))>,
     pub backfilling: bool,
     pub errors: Vec<String>,
-    legacy: HashMap<AgentKind, Usage>,
 }
 
 fn local_file_id(path: &Path) -> String {
@@ -766,7 +725,6 @@ fn apply(session: &mut Session, kind: AgentKind, v: &Value, day: NaiveDate) {
             if let Some(used) = quota["used_percent"].as_f64() {
                 session.usage.quota_used = Some(used);
                 session.usage.quota_reset = quota["resets_at"].as_i64();
-                session.quota_time = timestamp.to_owned();
             }
         }
         match ty {
@@ -1019,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_selects_latest_events_despite_stale_windows_mtime() {
+    fn codex_reads_recent_events_despite_stale_windows_mtime() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join(".codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
@@ -1053,12 +1011,14 @@ mod tests {
             .set_modified(SystemTime::from(now - chrono::Duration::days(2)))
             .unwrap();
         let mut collector = Collector::new(home.path().into());
-        let usage = collector.collect().remove(&AgentKind::Codex).unwrap();
+        let logs = collector.collect_logs(&[]);
+        let (kind, usage) = &logs.sessions[0];
+        assert_eq!(*kind, AgentKind::Codex);
         assert_eq!(usage.session_id, "active");
         assert_eq!(usage.project, "current-project");
         assert_eq!(usage.message, "current assistant message");
         assert!(usage.age < 10);
-        assert_eq!(usage.input, 1100);
+        assert_eq!(usage.input, 100);
         // Detect another append while LastWriteTime stays unchanged.
         use std::io::Write;
         let mut writer = std::fs::OpenOptions::new()
@@ -1070,7 +1030,7 @@ mod tests {
             .set_modified(SystemTime::from(now - chrono::Duration::days(2)))
             .unwrap();
         assert_eq!(
-            collector.collect()[&AgentKind::Codex].message,
+            collector.collect_logs(&[]).sessions[0].1.message,
             "new message"
         );
     }
@@ -1098,11 +1058,28 @@ mod tests {
             "internal approval review",
         );
         let mut collector = Collector::new(home.path().into());
-        let usage = collector.collect().remove(&AgentKind::Codex).unwrap();
+        let logs = collector.collect_logs(&[]);
+        assert_eq!(logs.sessions.len(), 1);
+        let (kind, usage) = &logs.sessions[0];
+        assert_eq!(*kind, AgentKind::Codex);
         assert_eq!(usage.session_id, "main");
         assert_eq!(usage.project, "my-project");
         assert_eq!(usage.message, "message to the user");
-        assert_eq!((usage.input, usage.output), (200, 40));
+        assert_eq!((usage.input, usage.output), (100, 20));
+        assert_eq!(
+            logs.events
+                .iter()
+                .map(|(_, _, tokens)| tokens.0)
+                .sum::<u64>(),
+            200
+        );
+        assert_eq!(
+            logs.events
+                .iter()
+                .map(|(_, _, tokens)| tokens.1)
+                .sum::<u64>(),
+            40
+        );
     }
 
     #[test]
@@ -1322,7 +1299,7 @@ mod tests {
         assert_eq!(s.tokens.len(), 1);
     }
     #[test]
-    fn collector_deduplicates_forks_and_handles_truncation() {
+    fn forks_keep_event_identity_and_truncation_clears_events() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join(".claude/projects/project");
         std::fs::create_dir_all(&root).unwrap();
@@ -1335,9 +1312,12 @@ mod tests {
             std::fs::write(root.join(name), &record).unwrap();
         }
         let mut collector = Collector::new(home.path().into());
-        assert_eq!(collector.collect()[&AgentKind::Claude].input, 10);
+        let logs = collector.collect_logs(&[]);
+        assert_eq!(logs.events.len(), 2);
+        assert_eq!(logs.events[0], logs.events[1]);
+        assert_eq!(logs.events[0].2, (10, 2));
         std::fs::write(root.join("a.jsonl"), "").unwrap();
         std::fs::write(root.join("b.jsonl"), "").unwrap();
-        assert_eq!(collector.collect()[&AgentKind::Claude].input, 0);
+        assert!(collector.collect_logs(&[]).events.is_empty());
     }
 }

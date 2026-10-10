@@ -1,4 +1,10 @@
-param([int]$MonitorPid, [ValidateSet('Inspect','Preview','Settings','Close','Quit','Minimize')][string]$Action='Inspect', [string]$Capture)
+param(
+  [int]$MonitorPid,
+  [ValidateSet('Inspect','Preview','Settings','Close','CloseThenSettings','Quit','Minimize','Suspend')][string]$Action='Inspect',
+  [string]$Capture,
+  [switch]$NoWait,
+  [int]$TimeoutSeconds=15
+)
 $ErrorActionPreference='Stop'
 # Native command IDs for the pinned muda 0.17 dependency: menu=1000,
 # followed by Preview=1001, Settings=1002, Quit=1003.
@@ -17,6 +23,16 @@ public static class MonitorWindows {
   [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern bool Process32FirstW(IntPtr snapshot,ref ProcessEntry entry);
   [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern bool Process32NextW(IntPtr snapshot,ref ProcessEntry entry);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
+  [DllImport("ntdll.dll")] static extern int NtSuspendProcess(IntPtr process);
+  public static void Suspend(uint pid) {
+    var process=OpenProcess(0x0800,false,pid);
+    if(process==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      int status=NtSuspendProcess(process);
+      if(status!=0) throw new InvalidOperationException("NtSuspendProcess returned "+status);
+    } finally {CloseHandle(process);}
+  }
   static HashSet<uint> Family(int targetPid) {
     var family=new HashSet<uint> {(uint)targetPid};
     var snapshot=CreateToolhelp32Snapshot(2,0);
@@ -63,15 +79,47 @@ $windows=[MonitorWindows]::List($MonitorPid)
 if ($Action -ne 'Inspect') {
   $trayWindow=$windows | Where-Object Class -eq 'tray_icon_app' | Select-Object -First 1
   $mainWindow=$windows | Where-Object Title -eq 'win-thermalright-ai-monitor' | Select-Object -First 1
-  [UIntPtr]$messageResult=[UIntPtr]::Zero
-  switch ($Action) {
-    'Preview' { [void][MonitorWindows]::SendMessageTimeout($trayWindow.Handle,0x111,[UIntPtr]::new([uint64]1001),[IntPtr]::Zero,2,2000,[ref]$messageResult) }
-    'Settings' { [void][MonitorWindows]::SendMessageTimeout($trayWindow.Handle,0x111,[UIntPtr]::new([uint64]1002),[IntPtr]::Zero,2,2000,[ref]$messageResult) }
-    'Quit' { [void][MonitorWindows]::SendMessageTimeout($trayWindow.Handle,0x111,[UIntPtr]::new([uint64]1003),[IntPtr]::Zero,2,2000,[ref]$messageResult) }
-    'Close' { [void][MonitorWindows]::SendMessageTimeout($mainWindow.Handle,0x10,[UIntPtr]::Zero,[IntPtr]::Zero,2,2000,[ref]$messageResult) }
-    'Minimize' { [void][MonitorWindows]::ShowWindow($mainWindow.Handle,6) }
+  function Send-WindowMessage($window, [uint32]$message, [uint64]$command) {
+    if (-not $window) { throw "No target window for $Action (monitor PID $MonitorPid)." }
+    [UIntPtr]$result=[UIntPtr]::Zero
+    if ([MonitorWindows]::SendMessageTimeout($window.Handle,$message,[UIntPtr]::new($command),[IntPtr]::Zero,2,2000,[ref]$result) -eq [IntPtr]::Zero) {
+      throw "Window did not accept $Action within the message timeout."
+    }
   }
-  Start-Sleep -Milliseconds 1500
+  switch ($Action) {
+    'Preview' { Send-WindowMessage $trayWindow 0x111 1001 }
+    'Settings' { Send-WindowMessage $trayWindow 0x111 1002 }
+    'Quit' { Send-WindowMessage $trayWindow 0x111 1003 }
+    'Close' { Send-WindowMessage $mainWindow 0x10 0 }
+    'CloseThenSettings' {
+      # Deliberately avoid waiting for the closing child before the tray request.
+      Send-WindowMessage $mainWindow 0x10 0
+      Send-WindowMessage $trayWindow 0x111 1002
+    }
+    'Minimize' { [void][MonitorWindows]::ShowWindow($mainWindow.Handle,6) }
+    'Suspend' {
+      if (-not $mainWindow -or $mainWindow.Pid -eq $MonitorPid) { throw 'Suspend requires a separate owned preview process.' }
+      [MonitorWindows]::Suspend($mainWindow.Pid)
+    }
+  }
+  if (-not $NoWait) {
+    $deadline=[DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+      $current=[MonitorWindows]::List($MonitorPid)
+      $preview=$current | Where-Object Title -eq 'win-thermalright-ai-monitor' | Select-Object -First 1
+      $ready=switch ($Action) {
+        'Close' { -not $preview }
+        'Quit' { -not $current }
+        'Minimize' { $preview -and $preview.Minimized }
+        'Suspend' { $preview }
+        'CloseThenSettings' { $preview -and $preview.Pid -ne $mainWindow.Pid -and $preview.Visible -and -not $preview.Minimized }
+        default { $preview -and $preview.Visible -and -not $preview.Minimized }
+      }
+      if ($ready) { break }
+      Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (-not $ready) { throw "Timed out waiting for $Action to complete (monitor PID $MonitorPid)." }
+  }
 }
 [MonitorWindows]::List($MonitorPid) | Select-Object Handle,Pid,Title,Class,Visible,Minimized,Foreground | ConvertTo-Json
 if ($Capture) {

@@ -92,12 +92,8 @@ impl Default for Output {
     }
 }
 impl Output {
-    fn preview_frame(
-        &self,
-        hidden: bool,
-        uploaded_sequence: Option<u64>,
-    ) -> Option<Arc<image::RgbaImage>> {
-        if hidden || uploaded_sequence == Some(self.sequence) {
+    fn preview_frame(&self, uploaded_sequence: Option<u64>) -> Option<Arc<image::RgbaImage>> {
+        if uploaded_sequence == Some(self.sequence) {
             None
         } else {
             self.frame.clone()
@@ -117,14 +113,15 @@ struct Dashboard {
     repaint_target: RepaintTarget,
     can_hide: bool,
     #[cfg(windows)]
-    tray_actions: Arc<Mutex<Vec<TrayAction>>>,
+    requests: Arc<Mutex<Vec<preview::Request>>>,
     #[cfg(windows)]
-    commands: Option<Arc<Mutex<std::io::Stdout>>>,
+    commands: std::io::Stdout,
     texture: Option<egui::TextureHandle>,
     sequence: u64,
     error: String,
+    shared_error: Arc<Mutex<String>>,
+    last_shared_error: String,
     show_settings: bool,
-    hidden: bool,
     quit: bool,
 }
 
@@ -190,23 +187,26 @@ fn pump_messages() {
 }
 type RepaintTarget = Arc<Mutex<Option<RepaintWindow>>>;
 
-struct Runtime {
+#[derive(Clone)]
+struct UiState {
     settings_path: PathBuf,
     shared_settings: Arc<Mutex<Settings>>,
     agents: Arc<Mutex<AgentSnapshot>>,
     view: Arc<Mutex<ViewState>>,
     output: Arc<Mutex<Output>>,
-    stop: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<()>>,
     repaint_target: RepaintTarget,
-    error: String,
+    error: Arc<Mutex<String>>,
     #[cfg(windows)]
-    remote: bool,
+    settings_epoch: Arc<std::sync::atomic::AtomicU64>,
+    can_hide: bool,
     #[cfg(windows)]
-    remote_can_hide: bool,
-    #[cfg(windows)]
-    remote_actions: Arc<Mutex<Vec<TrayAction>>>,
+    requests: Arc<Mutex<Vec<preview::Request>>>,
+}
+struct Runtime {
+    ui: UiState,
+    stop: Arc<AtomicBool>,
+    workers: Vec<JoinHandle<()>>,
     #[cfg(windows)]
     tray: Option<Tray>,
     #[cfg(windows)]
@@ -226,25 +226,26 @@ impl Runtime {
         let repaint_target: RepaintTarget = Arc::new(Mutex::new(None));
         let display_state = Arc::new(crate::power::DisplayState::default());
         #[cfg(windows)]
-        let background_window = BackgroundWindow::new()?;
+        let (background_window, window_error) = match BackgroundWindow::new() {
+            Ok(window) => (Some(window), String::new()),
+            Err(error) => (None, format!("Display power sync unavailable: {error:#}")),
+        };
         #[cfg(windows)]
-        let (display_power, power_error) =
-            match crate::power::DisplayPower::new(background_window.0, display_state.clone()) {
+        let (display_power, power_error) = if let Some(window) = &background_window {
+            match crate::power::DisplayPower::new(window.0, display_state.clone()) {
                 Ok(monitor) => (Some(monitor), String::new()),
                 Err(error) => (None, format!("Display power sync unavailable: {error:#}")),
-            };
-        let home = args.agent_home.clone().unwrap_or_else(|| {
-            directories::UserDirs::new()
-                .map(|d| d.home_dir().to_path_buf())
-                .unwrap_or_default()
-        });
+            }
+        } else {
+            (None, window_error)
+        };
         let agent_worker = if args.demo {
             None
         } else {
             let agents = agents.clone();
             let stop = stop.clone();
             let shared_settings = shared_settings.clone();
-            let home = home.clone();
+            let home = crate::home_for(args);
             Some(thread::spawn(move || {
                 let mut monitor =
                     Monitor::new(home, shared_settings.lock().unwrap().agents.clone());
@@ -264,7 +265,7 @@ impl Runtime {
             let cores = args.cores;
             let demo_sessions = args.demo_sessions as usize;
             thread::spawn(move || {
-                let mut metrics = if demo { None } else { Some(Metrics::new(home)) };
+                let mut metrics = if demo { None } else { Some(Metrics::new()) };
                 let start = Instant::now();
                 while !stop.load(Ordering::Relaxed) {
                     let value = if let Some(metrics) = &mut metrics {
@@ -408,63 +409,59 @@ impl Runtime {
         };
 
         #[cfg(windows)]
-        let (tray, tray_error) = match Tray::new(&repaint_target) {
+        let (tray, tray_error) = match Tray::new() {
             Ok(tray) => (Some(tray), String::new()),
             Err(error) => (None, format!("Tray unavailable: {error:#}")),
         };
+        #[cfg(windows)]
+        let error = [tray_error, power_error]
+            .into_iter()
+            .filter(|e| !e.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        #[cfg(not(windows))]
+        let error = String::new();
+        #[cfg(windows)]
+        if !error.is_empty() {
+            preview::diagnostic(&args.config.clone().unwrap_or_else(Settings::path), &error);
+        }
         Ok(Self {
-            settings_path: args.config.clone().unwrap_or_else(Settings::path),
-            shared_settings,
-            agents,
-            view,
-            output,
+            ui: UiState {
+                settings_path: args.config.clone().unwrap_or_else(Settings::path),
+                shared_settings,
+                agents,
+                view,
+                output,
+                shutdown,
+                repaint_target,
+                error: Arc::new(Mutex::new(error)),
+                #[cfg(windows)]
+                settings_epoch: Arc::default(),
+                #[cfg(windows)]
+                can_hide: tray.is_some(),
+                #[cfg(not(windows))]
+                can_hide: false,
+                #[cfg(windows)]
+                requests: Arc::default(),
+            },
             stop,
-            shutdown,
-            repaint_target,
             workers: [Some(metric_worker), Some(display_worker), agent_worker]
                 .into_iter()
                 .flatten()
                 .collect(),
             #[cfg(windows)]
-            error: [tray_error, power_error]
-                .into_iter()
-                .filter(|error| !error.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            #[cfg(not(windows))]
-            error: String::new(),
-            #[cfg(windows)]
             tray,
             #[cfg(windows)]
             _display_power: display_power,
             #[cfg(windows)]
-            _background_window: Some(background_window),
-            #[cfg(windows)]
-            remote: false,
-            #[cfg(windows)]
-            remote_can_hide: false,
-            #[cfg(windows)]
-            remote_actions: Arc::default(),
+            _background_window: background_window,
         })
     }
-    fn can_hide(&self) -> bool {
-        #[cfg(windows)]
-        {
-            if self.remote {
-                self.remote_can_hide
-            } else {
-                self.tray.is_some()
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
-    }
 }
+
 impl Drop for Runtime {
     fn drop(&mut self) {
-        *self.repaint_target.lock().unwrap() = None;
+        *self.ui.repaint_target.lock().unwrap() = None;
         self.stop.store(true, Ordering::Relaxed);
         for worker in self.workers.drain(..) {
             let _ = worker.join();
@@ -476,82 +473,119 @@ pub fn run(args: Args, settings: Settings) -> Result<()> {
     let _instance = InstanceGuard::acquire()?;
     let renderer = Renderer::new(settings.font.as_deref())?;
     let runtime = Runtime::new(&args, settings, renderer)?;
-    let mut show_preview = !args.background || args.preview || !runtime.can_hide();
-    let mut startup_decided = show_preview;
-    let mut last_connected = false;
-    let mut last_night = false;
     #[cfg(windows)]
-    let mut preview_process: Option<preview::PreviewProcess> = None;
-    while !runtime.shutdown.load(Ordering::Relaxed) {
-        #[cfg(windows)]
-        pump_messages();
-        let mut show_settings = false;
-        #[cfg(windows)]
-        for action in runtime.tray.as_ref().map(Tray::actions).unwrap_or_default() {
-            if let Some(preview) = &preview_process {
-                match action {
-                    TrayAction::Preview => preview.request(preview::UiRequest::Preview),
-                    TrayAction::Settings => preview.request(preview::UiRequest::Settings),
-                    TrayAction::Quit => runtime.shutdown.store(true, Ordering::Relaxed),
+    {
+        let mut wanted = !args.background || args.preview || !runtime.ui.can_hide;
+        let mut settings_wanted = false;
+        let mut startup_decided = wanted;
+        let (mut last_connected, mut last_night) = (false, false);
+        let mut process: Option<preview::PreviewProcess> = None;
+        let mut retry = preview::SpawnRetry::default();
+        while !runtime.ui.shutdown.load(Ordering::Relaxed) {
+            pump_messages();
+            if let Some(child) = &mut process {
+                child.apply_commands(&runtime.ui);
+                if runtime.ui.shutdown.load(Ordering::Relaxed) {
+                    break;
                 }
-                continue;
-            }
-            match action {
-                TrayAction::Preview => show_preview = true,
-                TrayAction::Settings => {
-                    show_preview = true;
-                    show_settings = true;
+                match child.exited() {
+                    Ok(true) => {
+                        child.apply_commands(&runtime.ui);
+                        let pending = child.pending_requests();
+                        if !pending.is_empty() {
+                            wanted = retry.failed(Instant::now());
+                            settings_wanted |= pending
+                                .iter()
+                                .any(|request| matches!(request, preview::UiRequest::Settings));
+                        }
+                        process = None;
+                        let output = runtime.ui.output.lock().unwrap();
+                        last_connected = output.connected;
+                        last_night = output.night;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        preview::report(
+                            &runtime.ui,
+                            &format!("Checking preview process failed: {error:#}"),
+                        );
+                        let pending = child.pending_requests();
+                        if !pending.is_empty() {
+                            wanted = retry.failed(Instant::now());
+                            settings_wanted |= pending
+                                .iter()
+                                .any(|request| matches!(request, preview::UiRequest::Settings));
+                        }
+                        process = None;
+                    }
                 }
-                TrayAction::Quit => runtime.shutdown.store(true, Ordering::Relaxed),
             }
-        }
-        if runtime.shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        #[cfg(windows)]
-        if let Some(preview) = &mut preview_process {
-            preview.apply_commands(&runtime);
-            if preview.exited()? {
-                preview.apply_commands(&runtime);
-                preview_process = None;
-                let output = runtime.output.lock().unwrap();
+            if runtime.ui.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            for action in runtime.tray.as_ref().map(Tray::actions).unwrap_or_default() {
+                if matches!(action, TrayAction::Quit) {
+                    runtime.ui.shutdown.store(true, Ordering::Relaxed);
+                    break;
+                }
+                retry.reset();
+                let request = match action {
+                    TrayAction::Settings => preview::UiRequest::Settings,
+                    TrayAction::Preview => preview::UiRequest::Preview,
+                    TrayAction::Quit => unreachable!(),
+                };
+                if let Some(child) = &mut process {
+                    child.request(request);
+                } else {
+                    wanted = true;
+                    settings_wanted |= matches!(request, preview::UiRequest::Settings);
+                }
+            }
+            if runtime.ui.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            {
+                let output = runtime.ui.output.lock().unwrap();
+                if !startup_decided && output.sequence > 0 {
+                    startup_decided = true;
+                    wanted |= !output.connected;
+                }
+                wanted |= (last_connected && !output.connected) || (!last_night && output.night);
                 last_connected = output.connected;
                 last_night = output.night;
             }
-        }
-        {
-            let output = runtime.output.lock().unwrap();
-            if !startup_decided && output.sequence > 0 {
-                startup_decided = true;
-                show_preview |= !output.connected;
+            if wanted && let Some(child) = &mut process {
+                child.request(preview::UiRequest::Preview);
+                wanted = false;
             }
-            show_preview |= (last_connected && !output.connected) || (!last_night && output.night);
-            last_connected = output.connected;
-            last_night = output.night;
-        }
-        if show_preview {
-            show_preview = false;
-            #[cfg(windows)]
-            {
-                if preview_process.is_none() {
-                    preview_process =
-                        Some(preview::PreviewProcess::spawn(&runtime, show_settings)?);
+            if wanted && retry.ready(Instant::now()) {
+                match preview::PreviewProcess::spawn(&runtime, settings_wanted) {
+                    Ok(child) => {
+                        process = Some(child);
+                        wanted = false;
+                        settings_wanted = false;
+                    }
+                    Err(error) => {
+                        preview::report(
+                            &runtime.ui,
+                            &format!("Starting preview failed: {error:#}"),
+                        );
+                        if !retry.failed(Instant::now()) {
+                            wanted = false;
+                        }
+                    }
                 }
+                startup_decided = true;
             }
-            #[cfg(not(windows))]
-            run_preview(&runtime, show_settings)?;
-            // Changes seen while the preview was open must not reopen it on hide.
-            let output = runtime.output.lock().unwrap();
-            last_connected = output.connected;
-            last_night = output.night;
-            startup_decided = true;
+            thread::sleep(Duration::from_millis(25));
         }
-        thread::sleep(Duration::from_millis(25));
     }
+    #[cfg(not(windows))]
+    run_preview(&runtime.ui, false)?;
     Ok(())
 }
 
-fn run_preview(runtime: &Runtime, show_settings: bool) -> Result<()> {
+fn run_preview(runtime: &UiState, show_settings: bool) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
@@ -564,10 +598,7 @@ fn run_preview(runtime: &Runtime, show_settings: bool) -> Result<()> {
         options,
         Box::new(move |cc| {
             let settings = runtime.shared_settings.lock().unwrap().clone();
-            let default_font = std::env::var_os("WINDIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "C:/Windows".into())
-                .join("Fonts/msyh.ttc");
+            let default_font = crate::fonts::default_path();
             if let Ok(bytes) =
                 crate::fonts::bytes(settings.font.as_deref().unwrap_or(&default_font))
             {
@@ -596,7 +627,8 @@ fn run_preview(runtime: &Runtime, show_settings: bool) -> Result<()> {
 }
 
 impl Dashboard {
-    fn new(runtime: &Runtime, settings: Settings, show_settings: bool) -> Self {
+    fn new(runtime: &UiState, settings: Settings, show_settings: bool) -> Self {
+        let error = runtime.error.lock().unwrap().clone();
         Self {
             settings,
             settings_path: runtime.settings_path.clone(),
@@ -606,37 +638,24 @@ impl Dashboard {
             output: runtime.output.clone(),
             shutdown: runtime.shutdown.clone(),
             repaint_target: runtime.repaint_target.clone(),
-            can_hide: runtime.can_hide(),
+            can_hide: runtime.can_hide,
             #[cfg(windows)]
-            tray_actions: runtime
-                .tray
-                .as_ref()
-                .map(|tray| tray.pending.clone())
-                .unwrap_or_else(|| runtime.remote_actions.clone()),
+            requests: runtime.requests.clone(),
             #[cfg(windows)]
-            commands: runtime
-                .remote
-                .then(|| Arc::new(Mutex::new(std::io::stdout()))),
+            commands: std::io::stdout(),
             frame_view: ViewState::default(),
             show_sessions: false,
             texture: None,
             sequence: 0,
-            error: runtime.error.clone(),
+            error: error.clone(),
+            shared_error: runtime.error.clone(),
+            last_shared_error: error,
             show_settings,
-            hidden: false,
             quit: false,
         }
     }
-    fn visible(&mut self, ctx: &egui::Context, visible: bool) {
-        self.hidden = !visible;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
-        if visible {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            ctx.request_repaint();
-        } else {
-            self.texture = None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
+    fn close_preview(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
     fn can_hide(&self) -> bool {
         self.can_hide
@@ -645,17 +664,16 @@ impl Dashboard {
         *self.shared_settings.lock().unwrap() = self.settings.clone();
         #[cfg(windows)]
         self.command(preview::ClientCommand::Settings(self.settings.clone()));
+        #[cfg(not(windows))]
         if let Err(e) = self.settings.save(&self.settings_path) {
             self.error = e.to_string();
         }
     }
     #[cfg(windows)]
     fn command(&mut self, command: preview::ClientCommand) {
-        if let Some(commands) = &self.commands
-            && let Err(error) = preview::send_command(&mut *commands.lock().unwrap(), &command)
-        {
+        if let Err(error) = preview::send_command(&mut self.commands, &command) {
             self.error = format!("后台连接已断开：{error}");
-            self.quit = true;
+            self.shutdown.store(true, Ordering::Relaxed);
         }
     }
     fn settings_ui(&mut self, ctx: &egui::Context) {
@@ -734,33 +752,33 @@ impl Dashboard {
 }
 impl eframe::App for Dashboard {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        #[cfg(windows)]
-        {
-            let actions: Vec<_> = self.tray_actions.lock().unwrap().drain(..).collect();
-            for action in actions {
-                if !matches!(action, TrayAction::Quit)
-                    && let Some(target) = self.repaint_target.lock().unwrap().clone()
-                {
-                    target.window.restore(true);
-                }
-                match action {
-                    TrayAction::Preview => self.visible(ctx, true),
-                    TrayAction::Settings => {
-                        self.show_settings = true;
-                        self.visible(ctx, true);
-                    }
-                    TrayAction::Quit => self.quit = true,
-                }
-            }
-        }
         if self.quit || self.shutdown.load(Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.can_hide() {
-            self.hidden = true;
+        if ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
+        #[cfg(windows)]
+        {
+            let requests: Vec<_> = self.requests.lock().unwrap().drain(..).collect();
+            for request in requests {
+                match request.action {
+                    preview::UiRequest::Preview => {}
+                    preview::UiRequest::Settings => self.show_settings = true,
+                }
+                if let Some(target) = self.repaint_target.lock().unwrap().clone() {
+                    target.window.restore(true);
+                }
+                self.command(preview::ClientCommand::HandledRequest(request.id));
+            }
+        }
+        let shared_error = self.shared_error.lock().unwrap().clone();
+        if shared_error != self.last_shared_error {
+            self.error = shared_error.clone();
+            self.last_shared_error = shared_error;
+        }
+        self.settings = self.shared_settings.lock().unwrap().clone();
         let (status, fps, night, system_off, sequence, frame, frame_view) = {
             let output = self.output.lock().unwrap();
             (
@@ -769,7 +787,7 @@ impl eframe::App for Dashboard {
                 output.night,
                 output.system_off,
                 output.sequence,
-                output.preview_frame(self.hidden, self.texture.as_ref().map(|_| self.sequence)),
+                output.preview_frame(self.texture.as_ref().map(|_| self.sequence)),
                 output.view.clone(),
             )
         };
@@ -791,7 +809,7 @@ impl eframe::App for Dashboard {
                     self.show_settings = true;
                 }
                 if self.can_hide() && ui.button("隐藏到托盘").clicked() {
-                    self.visible(ctx, false);
+                    self.close_preview(ctx);
                 }
                 if ui.button("退出").clicked() {
                     self.quit = true;
@@ -1019,7 +1037,7 @@ struct Tray {
 }
 #[cfg(windows)]
 impl Tray {
-    fn new(repaint_target: &RepaintTarget) -> Result<Self> {
+    fn new() -> Result<Self> {
         use tray_icon::{
             Icon, TrayIconBuilder, TrayIconEvent,
             menu::{Menu, MenuEvent, MenuItem},
@@ -1036,7 +1054,6 @@ impl Tray {
         // The tray belongs to the background runtime. With no preview, the outer
         // message pump consumes these actions; an existing preview is restored.
         // Install handlers before creating the icon: they are initialized once.
-        let wake = repaint_target.clone();
         let events = pending.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let action = if event.id == preview_id {
@@ -1048,22 +1065,12 @@ impl Tray {
             } else {
                 return;
             };
-            let focus = !matches!(action, TrayAction::Quit);
             events.lock().unwrap().push(action);
-            if let Some(target) = wake.lock().unwrap().as_ref() {
-                target.window.restore(focus);
-                target.ctx.request_repaint();
-            }
         }));
-        let wake = repaint_target.clone();
         let events = pending.clone();
         TrayIconEvent::set_event_handler(Some(move |event| {
             if matches!(event, TrayIconEvent::DoubleClick { .. }) {
                 events.lock().unwrap().push(TrayAction::Preview);
-                if let Some(target) = wake.lock().unwrap().as_ref() {
-                    target.window.restore(true);
-                    target.ctx.request_repaint();
-                }
             }
         }));
         let mut pixels = vec![0; 32 * 32 * 4];
@@ -1181,30 +1188,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preview_skips_hidden_frames_and_restores_the_latest_shared_frame() {
+    fn preview_uploads_each_sequence_once_and_reopens_with_latest_frame() {
         let first = Arc::new(image::RgbaImage::new(2, 1));
         let mut output = Output {
             frame: Some(first.clone()),
             sequence: 1,
             ..Default::default()
         };
-        assert!(output.preview_frame(true, None).is_none());
-        let frame = output.preview_frame(false, None).unwrap();
+        assert!(output.preview_frame(Some(1)).is_none());
+        let frame = output.preview_frame(None).unwrap();
         assert!(Arc::ptr_eq(&frame, &first));
-        assert!(output.preview_frame(false, Some(1)).is_none());
+        assert!(output.preview_frame(Some(1)).is_none());
         let latest = Arc::new(image::RgbaImage::new(2, 1));
         output.frame = Some(latest.clone());
         output.sequence = 2;
-        assert!(output.preview_frame(true, Some(1)).is_none());
+        assert!(output.preview_frame(Some(2)).is_none());
         assert!(Arc::ptr_eq(
-            &output.preview_frame(false, Some(1)).unwrap(),
+            &output.preview_frame(Some(1)).unwrap(),
             &latest
         ));
         // Reopening after releasing the texture must upload even an unchanged frame.
-        assert!(Arc::ptr_eq(
-            &output.preview_frame(false, None).unwrap(),
-            &latest
-        ));
+        assert!(Arc::ptr_eq(&output.preview_frame(None).unwrap(), &latest));
     }
 
     #[test]

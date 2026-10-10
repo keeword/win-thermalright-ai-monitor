@@ -39,7 +39,6 @@ pub struct Monitor {
     stop: Arc<AtomicBool>,
     merger: Merger,
     ledger: HashMap<(AgentKind, String), (u64, u64)>,
-    source_ledger: HashMap<(String, AgentKind, String), (u64, u64)>,
     day: chrono::NaiveDate,
     coverage: HashMap<String, bool>,
 }
@@ -119,7 +118,6 @@ impl Monitor {
             stop,
             merger: Merger::default(),
             ledger: HashMap::new(),
-            source_ledger: HashMap::new(),
             day: chrono::Local::now().date_naive(),
             coverage: HashMap::new(),
         }
@@ -219,7 +217,6 @@ impl Monitor {
         let day = chrono::Local::now().date_naive();
         if self.day != day {
             self.ledger.clear();
-            self.source_ledger.clear();
             self.coverage.clear();
             self.day = day;
         }
@@ -293,12 +290,6 @@ impl Monitor {
                         .into_iter()
                         .filter(|_| logs.day == Some(self.day))
                     {
-                        let source = self
-                            .source_ledger
-                            .entry((origin.origin_id.clone(), kind, id.clone()))
-                            .or_default();
-                        source.0 = source.0.max(tokens.0);
-                        source.1 = source.1.max(tokens.1);
                         let value = self.ledger.entry((kind, id)).or_default();
                         value.0 = value.0.max(tokens.0);
                         value.1 = value.1.max(tokens.1);
@@ -361,12 +352,6 @@ impl Monitor {
             }
         }
         self.merger.refresh(chrono::Utc::now().timestamp());
-        let mut by_origin = HashMap::<(String, AgentKind), (u64, u64)>::new();
-        for ((origin, kind, _), tokens) in &self.source_ledger {
-            let value = by_origin.entry((origin.clone(), *kind)).or_default();
-            value.0 = value.0.saturating_add(tokens.0);
-            value.1 = value.1.saturating_add(tokens.1);
-        }
         self.merger.snapshot.daily_usage = crate::session::DailyUsage {
             available: !self.ledger.is_empty()
                 || (self
@@ -380,17 +365,6 @@ impl Monitor {
                         .iter()
                         .any(|o| o.error.is_some())),
             day: self.day.to_string(),
-            by_origin: by_origin
-                .into_iter()
-                .map(
-                    |((origin_id, kind), (input, output))| crate::session::OriginUsage {
-                        origin_id,
-                        agent_kind: Some(kind),
-                        input,
-                        output,
-                    },
-                )
-                .collect(),
             input: self.ledger.values().map(|v| v.0).sum(),
             output: self.ledger.values().map(|v| v.1).sum(),
             coverage: if self
@@ -440,5 +414,78 @@ impl Drop for Monitor {
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daily_usage_deduplicates_events_across_sources_and_resets_at_midnight() {
+        let home = tempfile::tempdir().unwrap();
+        let mut monitor = Monitor::new(home.path().into(), AgentSettings::default());
+        let future = Instant::now() + Duration::from_secs(60);
+        monitor.discovery = future;
+        let (send, receive) = mpsc::channel();
+        monitor.receive = receive;
+        let day = monitor.day;
+        for id in ["windows", "wsl"] {
+            let job = Job {
+                id: id.into(),
+                distro: None,
+                registration: String::new(),
+                user: None,
+            };
+            monitor.jobs.push(job.clone());
+            monitor.due.insert(job.id.clone(), future);
+            send.send(Work {
+                job,
+                result: Ok((
+                    ProbeResult {
+                        origin_id: id.into(),
+                        complete: true,
+                        ..Default::default()
+                    },
+                    LogSnapshot {
+                        day: Some(day),
+                        events: vec![
+                            (AgentKind::Claude, "forked-message".into(), (10, 2)),
+                            (AgentKind::Claude, "forked-message".into(), (20, 3)),
+                            (AgentKind::Codex, "guardian-usage".into(), (5, 1)),
+                        ],
+                        ..Default::default()
+                    },
+                )),
+            })
+            .unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let usage = monitor.tick(&stop).daily_usage;
+        assert!(usage.available);
+        assert_eq!((usage.input, usage.output), (25, 4));
+        let unchanged = monitor.tick(&stop).daily_usage;
+        assert_eq!((unchanged.input, unchanged.output), (25, 4));
+
+        monitor.day = day.pred_opt().unwrap();
+        send.send(Work {
+            job: monitor.jobs[0].clone(),
+            result: Ok((
+                ProbeResult {
+                    origin_id: "windows".into(),
+                    complete: true,
+                    ..Default::default()
+                },
+                LogSnapshot {
+                    day: Some(monitor.day),
+                    events: vec![(AgentKind::Claude, "yesterday".into(), (100, 50))],
+                    ..Default::default()
+                },
+            )),
+        })
+        .unwrap();
+        let usage = monitor.tick(&stop).daily_usage;
+        assert_eq!(usage.day, day.to_string());
+        assert_eq!((usage.input, usage.output), (0, 0));
     }
 }

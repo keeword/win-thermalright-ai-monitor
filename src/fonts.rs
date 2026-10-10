@@ -9,6 +9,17 @@ use std::{
 
 static FONT_BYTES: OnceLock<Mutex<HashMap<PathBuf, &'static [u8]>>> = OnceLock::new();
 
+pub fn directory() -> PathBuf {
+    std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "C:/Windows".into())
+        .join("Fonts")
+}
+
+pub fn default_path() -> PathBuf {
+    directory().join("msyh.ttc")
+}
+
 pub fn bytes(path: &Path) -> Result<&'static [u8]> {
     let path = path
         .canonicalize()
@@ -19,13 +30,50 @@ pub fn bytes(path: &Path) -> Result<&'static [u8]> {
     }
     #[cfg(windows)]
     let bytes = {
-        let mapped = Box::leak(Box::new(MappedFont::open(&path)?));
-        &mapped.data[..]
+        let storage = Box::leak(Box::new(FontStorage::open(&path)?));
+        storage.as_slice()
     };
     #[cfg(not(windows))]
     let bytes: &'static [u8] = Box::leak(std::fs::read(&path)?.into_boxed_slice());
     fonts.insert(path, bytes);
     Ok(bytes)
+}
+
+#[cfg(windows)]
+enum FontStorage {
+    Mapped(MappedFont),
+    Owned(Box<[u8]>),
+}
+
+#[cfg(windows)]
+impl FontStorage {
+    fn open(path: &Path) -> Result<Self> {
+        match MappedFont::open(path) {
+            Ok(mapped) => Ok(Self::Mapped(mapped)),
+            Err(error)
+                if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    error.raw_os_error()
+                        == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+                }) =>
+            {
+                // An existing writer/deleter can prevent a protected mapping.
+                // A private copy remains immutable even if that handle changes
+                // the file later; never relax the mapped file's sharing mode.
+                let bytes = std::fs::read(path).with_context(|| {
+                    format!("Reading font {} after sharing conflict", path.display())
+                })?;
+                Ok(Self::Owned(bytes.into_boxed_slice()))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mapped) => &mapped.data,
+            Self::Owned(bytes) => bytes,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -56,6 +104,44 @@ impl MappedFont {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharing_conflict_uses_an_immutable_private_copy() {
+        use std::io::{Seek, SeekFrom, Write};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("font.bin");
+        std::fs::write(&path, b"original font bytes").unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let font = FontStorage::open(&path).unwrap();
+        assert!(matches!(font, FontStorage::Owned(_)));
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.write_all(b"modified font bytes").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(font.as_slice(), b"original font bytes");
+        assert_eq!(std::fs::read(&path).unwrap(), b"modified font bytes");
+    }
+
+    #[test]
+    fn ordinary_font_uses_mapping_and_exclusive_access_still_reports_an_error() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("font.bin");
+        std::fs::write(&path, b"font bytes").unwrap();
+        assert!(matches!(
+            FontStorage::open(&path).unwrap(),
+            FontStorage::Mapped(_)
+        ));
+        let _exclusive = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(FontStorage::open(&path).is_err());
+    }
 
     #[test]
     fn mapped_bytes_cannot_be_changed_until_the_font_is_released() {

@@ -150,12 +150,7 @@ fn execute() -> Result<()> {
         cfg.agent_view.mode = mode;
     }
     if args.diagnostics {
-        let home = args.agent_home.clone().unwrap_or_else(|| {
-            directories::UserDirs::new()
-                .map(|d| d.home_dir().to_path_buf())
-                .unwrap_or_default()
-        });
-        let mut collector = metrics::Metrics::new(home);
+        let mut collector = metrics::Metrics::new();
         collector.collect();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let s = collector.collect();
