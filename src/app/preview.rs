@@ -256,8 +256,8 @@ impl PreviewProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        crate::probe::hidden(&mut command);
-        let mut child = command.spawn().context("Starting preview process")?;
+        let mut child =
+            crate::probe::spawn_hidden(&mut command).context("Starting preview process")?;
         let mut writer = child.stdin.take().unwrap();
         let mut reader = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
@@ -821,8 +821,7 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        crate::probe::hidden(&mut command);
-        let mut child = command.spawn().unwrap();
+        let mut child = crate::probe::spawn_hidden(&mut command).unwrap();
         let mut writer = child.stdin.take().unwrap();
         let finished = Arc::new(AtomicBool::new(false));
         let done = finished.clone();

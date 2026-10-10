@@ -8,7 +8,6 @@ use crate::{
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    process::Command,
     sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -84,9 +83,7 @@ impl Monitor {
                                 &stop,
                             )?
                         } else {
-                            let mut command = Command::new(std::env::current_exe()?);
-                            command.arg("--probe-windows");
-                            serde_json::from_slice(&probe::run(&mut command, None, &stop)?)?
+                            serde_json::from_slice(&probe::local(&stop)?)?
                         };
                         *cursors.lock().unwrap().entry(job.id.clone()).or_default() += 3;
                         let mut logs = if job.distro.is_some() {

@@ -15,6 +15,16 @@ use std::{
 
 #[cfg(any(windows, test))]
 mod claude;
+#[cfg(windows)]
+mod windows_child;
+
+pub fn local(stop: &AtomicBool) -> anyhow::Result<Vec<u8>> {
+    let executable = std::env::current_exe()?;
+    #[cfg(windows)]
+    return windows_child::run(&executable, "--probe-windows", stop);
+    #[cfg(not(windows))]
+    run(Command::new(executable).arg("--probe-windows"), None, stop)
+}
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ProbeResult {
@@ -43,30 +53,68 @@ pub struct RemoteFile {
     #[serde(default)]
     pub recent_data: String,
 }
-pub fn hidden(command: &mut Command) {
+pub(super) static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn spawn_hidden(command: &mut Command) -> std::io::Result<std::process::Child> {
+    let _lock = SPAWN_LOCK.lock().unwrap();
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let _ = command;
+    command.spawn()
 }
 pub fn run(
     command: &mut Command,
     input: Option<&[u8]>,
     stop: &AtomicBool,
 ) -> anyhow::Result<Vec<u8>> {
-    hidden(command);
-    let mut child = command
+    command
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = spawn_hidden(command)?;
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let writer = input.map(|input| {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        let bytes = input.to_vec();
+        std::thread::spawn(move || stdin.write_all(&bytes))
+    });
+    read_output(
+        stdout,
+        stderr,
+        &command.get_program().to_string_lossy(),
+        writer,
+        || {
+            let start = Instant::now();
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                if stop.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(2) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("probe timed out or cancelled");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        },
+    )
+}
+
+fn read_output(
+    stdout: impl Read + Send + 'static,
+    stderr: impl Read + Send + 'static,
+    program: &str,
+    writer: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    wait: impl FnOnce() -> anyhow::Result<std::process::ExitStatus>,
+) -> anyhow::Result<Vec<u8>> {
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         stdout
@@ -74,32 +122,13 @@ pub fn run(
             .read_to_end(&mut bytes)
             .map(|_| bytes)
     });
-    let stderr = child.stderr.take().unwrap();
     let error_reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         stderr.take(65536).read_to_end(&mut bytes).map(|_| bytes)
     });
-    let writer = input.map(|input| {
-        use std::io::Write;
-        let mut stdin = child.stdin.take().unwrap();
-        let bytes = input.to_vec();
-        std::thread::spawn(move || stdin.write_all(&bytes))
-    });
-    let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
-        }
-        if stop.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(2) {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = wait()?;
     // Killing the direct child may leave inherited pipes open in WSL. Never
     // join an unfinished pipe reader; the guest also enforces its own budget.
-    anyhow::ensure!(status.is_some(), "probe timed out or cancelled");
     let deadline = Instant::now() + Duration::from_millis(150);
     while (!reader.is_finished() || !error_reader.is_finished()) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -113,10 +142,10 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("probe error reader failed"))??;
     anyhow::ensure!(
-        status.unwrap().success(),
+        status.success(),
         "{} exited with {}: {}",
-        command.get_program().to_string_lossy(),
-        status.unwrap(),
+        program,
+        status,
         decode_wsl(if errors.is_empty() { &bytes } else { &errors })
             .trim()
             .chars()
