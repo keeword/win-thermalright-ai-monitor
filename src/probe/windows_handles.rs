@@ -237,6 +237,18 @@ mod tests {
 
     #[test]
     fn held_unix_socket_peer_query_preserves_the_connection_and_rollout_cursor() {
+        // Other tests' pending pipe I/O can block queries; isolate handles as in production.
+        super::super::windows_child::run(
+            &std::env::current_exe().unwrap(),
+            "--ignored --exact probe::windows_handles::tests::held_unix_socket_peer_query_child --nocapture",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "helper executed by the bounded handle query regression test"]
+    fn held_unix_socket_peer_query_child() {
         use std::io::{Seek, Write};
         let _winsock = Winsock::new().unwrap();
         let directory = tempfile::tempdir().unwrap();
