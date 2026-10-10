@@ -3,6 +3,7 @@
 mod agents;
 mod app;
 mod config;
+mod fonts;
 mod metrics;
 mod monitor;
 mod power;
@@ -71,6 +72,9 @@ pub struct Args {
     diagnostics_seconds: u32,
     #[arg(long, hide = true)]
     probe_windows: bool,
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    preview_client: bool,
 }
 
 fn main() {
@@ -78,7 +82,12 @@ fn main() {
     let headless = std::env::args().any(|arg| {
         matches!(
             arg.as_str(),
-            "--snapshot" | "--gif" | "--benchmark" | "--diagnostics" | "--probe-windows"
+            "--snapshot"
+                | "--gif"
+                | "--benchmark"
+                | "--diagnostics"
+                | "--probe-windows"
+                | "--preview-client"
         )
     });
     #[cfg(all(windows, not(debug_assertions)))]
@@ -127,6 +136,10 @@ fn attach_parent_console() -> bool {
 
 fn execute() -> Result<()> {
     let args = Args::parse();
+    #[cfg(windows)]
+    if args.preview_client {
+        return app::run_preview_client();
+    }
     if args.probe_windows {
         #[cfg(windows)]
         println!("{}", serde_json::to_string(&probe::windows_probe()?)?);

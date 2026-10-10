@@ -8,6 +8,26 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class MonitorWindows {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct ProcessEntry {
+    public uint Size,Usage,Pid; public UIntPtr Heap; public uint Module,Threads,Parent;
+    public int Priority; public uint Flags;
+    [MarshalAs(UnmanagedType.ByValTStr,SizeConst=260)] public string Exe;
+  }
+  [DllImport("kernel32.dll")] static extern IntPtr CreateToolhelp32Snapshot(uint flags,uint pid);
+  [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern bool Process32FirstW(IntPtr snapshot,ref ProcessEntry entry);
+  [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern bool Process32NextW(IntPtr snapshot,ref ProcessEntry entry);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+  static HashSet<uint> Family(int targetPid) {
+    var family=new HashSet<uint> {(uint)targetPid};
+    var snapshot=CreateToolhelp32Snapshot(2,0);
+    try {
+      var entry=new ProcessEntry {Size=(uint)Marshal.SizeOf(typeof(ProcessEntry))};
+      if(Process32FirstW(snapshot,ref entry)) do {
+        if(entry.Parent==(uint)targetPid) family.Add(entry.Pid);
+      } while(Process32NextW(snapshot,ref entry));
+    } finally {CloseHandle(snapshot);}
+    return family;
+  }
   public delegate bool EnumCallback(IntPtr window, IntPtr param);
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumCallback callback, IntPtr param);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
@@ -22,15 +42,16 @@ public static class MonitorWindows {
   [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr window, IntPtr dc, uint flags);
   [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
-  public class Info { public IntPtr Handle; public string Title; public string Class; public bool Visible; public bool Minimized; public bool Foreground; }
+  public class Info { public IntPtr Handle; public uint Pid; public string Title; public string Class; public bool Visible; public bool Minimized; public bool Foreground; }
   public static Info[] List(int targetPid) {
     var result=new List<Info>();
+    var family=Family(targetPid);
     EnumWindows((window,param)=> {
       uint owner; GetWindowThreadProcessId(window,out owner);
-      if(owner==(uint)targetPid) {
+      if(family.Contains(owner)) {
         var title=new StringBuilder(256);var name=new StringBuilder(256);
         GetWindowText(window,title,256);GetClassName(window,name,256);
-        result.Add(new Info {Handle=window,Title=title.ToString(),Class=name.ToString(),Visible=IsWindowVisible(window),Minimized=IsIconic(window),Foreground=GetForegroundWindow()==window});
+        result.Add(new Info {Handle=window,Pid=owner,Title=title.ToString(),Class=name.ToString(),Visible=IsWindowVisible(window),Minimized=IsIconic(window),Foreground=GetForegroundWindow()==window});
       }
       return true;
     },IntPtr.Zero);
@@ -52,7 +73,7 @@ if ($Action -ne 'Inspect') {
   }
   Start-Sleep -Milliseconds 1500
 }
-[MonitorWindows]::List($MonitorPid) | Select-Object Handle,Title,Class,Visible,Minimized,Foreground | ConvertTo-Json
+[MonitorWindows]::List($MonitorPid) | Select-Object Handle,Pid,Title,Class,Visible,Minimized,Foreground | ConvertTo-Json
 if ($Capture) {
   Add-Type -AssemblyName System.Drawing
   $mainWindow=[MonitorWindows]::List($MonitorPid) | Where-Object Title -eq 'win-thermalright-ai-monitor' | Select-Object -First 1

@@ -16,10 +16,11 @@ function Invoke-TrayAction([string]$action) {
 }
 function Assert-Window([string]$action, [bool]$visible, [bool]$minimized = $false) {
     $window = Invoke-TrayAction $action
-    if (-not $window -or $window.Visible -ne $visible -or $window.Minimized -ne $minimized) {
+    if (($visible -and (-not $window -or -not $window.Visible -or $window.Minimized -ne $minimized)) -or
+        (-not $visible -and $window)) {
         throw "Tray regression failed after $action : expected visible=$visible, minimized=$minimized."
     }
-    Write-Output "$action : visible=$visible, minimized=$minimized"
+    Write-Output "$action : visible=$visible, minimized=$minimized, preview destroyed when hidden"
 }
 
 $monitor = Start-Process -FilePath $Executable -ArgumentList @('--demo', '--preview', '--config', ('"{0}"' -f $configPath)) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $testRoot 'stdout.log') -RedirectStandardError (Join-Path $testRoot 'stderr.log')
@@ -40,11 +41,30 @@ try {
     $null = & $driver -MonitorPid $monitor.Id -Action Inspect -Capture (Join-Path $testRoot 'settings.png')
     Assert-Window 'Minimize' $true $true
     Assert-Window 'Preview' $true
+    $window = Invoke-TrayAction 'Inspect'
+    $previewPid = $window.Pid
+    if ($previewPid -eq $monitor.Id) { throw 'Preview did not run in a separate process.' }
+    Stop-Process -Id $previewPid
+    Start-Sleep -Milliseconds 500
+    if ($monitor.HasExited) { throw 'Preview crash stopped the background runtime.' }
+    Assert-Window 'Preview' $true
     Assert-Window 'Close' $false
     $null = Invoke-TrayAction 'Quit'
     if (-not $monitor.WaitForExit(5000)) { throw 'Quit from hidden tray did not exit.' }
     if ($monitor.ExitCode -ne 0) { throw "Monitor exited with code $($monitor.ExitCode)." }
+    # Also exercise Quit while the preview is still open, including child cleanup.
+    $monitor = Start-Process -FilePath $Executable -ArgumentList @('--demo', '--preview', '--config', ('"{0}"' -f $configPath)) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $testRoot 'visible-stdout.log') -RedirectStandardError (Join-Path $testRoot 'visible-stderr.log')
+    Start-Sleep -Seconds 2
+    $window = Invoke-TrayAction 'Inspect'
+    if (-not $window) { throw 'Second preview was not created.' }
+    $previewPid = $window.Pid
+    $null = Invoke-TrayAction 'Quit'
+    if (-not $monitor.WaitForExit(5000)) { throw 'Quit with a visible preview did not exit.' }
+    if (Get-Process -Id $previewPid -ErrorAction SilentlyContinue) { throw 'Quit left an orphan preview process.' }
     Write-Output 'Windows tray regression passed; inspect target/tray-regression/settings.png for the settings panel.'
 } finally {
-    if (-not $monitor.HasExited) { Stop-Process -Id $monitor.Id }
+    if (-not $monitor.HasExited) {
+        $null = Invoke-TrayAction 'Quit'
+        if (-not $monitor.WaitForExit(10000)) { Stop-Process -Id $monitor.Id }
+    }
 }

@@ -726,12 +726,13 @@ impl Default for ViewPreferences {
         }
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ViewState {
     pub preferences: ViewPreferences,
     pub mode: ViewMode,
     pub page: usize,
     pub keys: Vec<SessionKey>,
+    #[serde(skip, default = "Instant::now")]
     next_rotate: Instant,
     paused: bool,
 }

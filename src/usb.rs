@@ -3,7 +3,7 @@ use crate::{
     protocol::{self, DeviceInfo},
 };
 use anyhow::{Context, Result, ensure};
-use image::RgbaImage;
+use image::{RgbImage, RgbaImage};
 use rusb::{DeviceHandle, Direction, TransferType, UsbContext};
 use std::time::Duration;
 
@@ -13,7 +13,72 @@ pub struct Lcd {
     ep_out: u8,
     ep_in: u8,
     pid: u16,
+    encoder: FrameEncoder,
     pub info: DeviceInfo,
+}
+
+struct FrameEncoder {
+    rgb: RgbImage,
+    jpeg: Vec<u8>,
+}
+impl Default for FrameEncoder {
+    fn default() -> Self {
+        Self {
+            rgb: RgbImage::new(0, 0),
+            jpeg: Vec::new(),
+        }
+    }
+}
+impl FrameEncoder {
+    fn prepare_rgb(&mut self, frame: &RgbaImage, width: u32, height: u32, settings: &Settings) {
+        let resized;
+        let frame = if frame.dimensions() == (width, height) {
+            frame
+        } else {
+            resized = image::imageops::resize(
+                frame,
+                width,
+                height,
+                image::imageops::FilterType::Triangle,
+            );
+            &resized
+        };
+        if self.rgb.dimensions() != (width, height) {
+            self.rgb = RgbImage::new(width, height);
+        }
+        let count = width as usize * height as usize;
+        let factor = 1.0 + (settings.brightness.clamp(1, 10) - 1) as f32 * 0.3;
+        let rgb = self.rgb.as_mut();
+        // Fold rotation, brightness and RGBA -> RGB into one pass. The usual
+        // 1920x480 device needs no intermediate resize or rotated RGBA buffers.
+        for (index, pixel) in frame.pixels().enumerate() {
+            let target = if settings.rotate {
+                count - 1 - index
+            } else {
+                index
+            } * 3;
+            for channel in 0..3 {
+                rgb[target + channel] = (pixel[channel] as f32 * factor).min(255.0) as u8;
+            }
+        }
+    }
+    fn encode(
+        &mut self,
+        frame: &RgbaImage,
+        info: DeviceInfo,
+        settings: &Settings,
+    ) -> Result<&[u8]> {
+        self.prepare_rgb(frame, info.width, info.height, settings);
+        for quality in [90, 80, 70, 60, 50, 40, 30] {
+            self.jpeg.clear();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut self.jpeg, quality)
+                .encode_image(&self.rgb)?;
+            if self.jpeg.len() <= protocol::MAX_JPEG {
+                break;
+            }
+        }
+        Ok(&self.jpeg)
+    }
 }
 
 impl Lcd {
@@ -62,6 +127,7 @@ impl Lcd {
                         ep_out: out.address(),
                         ep_in: input.address(),
                         pid: descriptor.product_id(),
+                        encoder: FrameEncoder::default(),
                         info: DeviceInfo {
                             pm: 0,
                             width: 1920,
@@ -114,32 +180,8 @@ impl Lcd {
         })
     }
     pub fn send(&mut self, frame: &RgbaImage, settings: &Settings) -> Result<()> {
-        let mut frame = image::imageops::resize(
-            frame,
-            self.info.width,
-            self.info.height,
-            image::imageops::FilterType::Triangle,
-        );
-        if settings.rotate {
-            frame = image::imageops::rotate180(&frame);
-        }
-        let factor = 1.0 + (settings.brightness.clamp(1, 10) - 1) as f32 * 0.3;
-        for pixel in frame.pixels_mut() {
-            for c in &mut pixel.0[..3] {
-                *c = (*c as f32 * factor).min(255.0) as u8;
-            }
-        }
-        let rgb = image::DynamicImage::ImageRgba8(frame).to_rgb8();
-        let mut encoded = Vec::new();
-        for quality in [90, 80, 70, 60, 50, 40, 30] {
-            encoded.clear();
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality)
-                .encode_image(&rgb)?;
-            if encoded.len() <= protocol::MAX_JPEG {
-                break;
-            }
-        }
-        let packets = protocol::packetize(&encoded, self.pid)?;
+        let encoded = self.encoder.encode(frame, self.info, settings)?;
+        let packets = protocol::packetize(encoded, self.pid)?;
         for batch in packets.chunks(4096) {
             self.write(batch)?;
         }
@@ -181,6 +223,72 @@ impl Drop for Lcd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reusable_rgb_matches_resize_rotation_and_brightness_for_all_profiles() {
+        let frame = RgbaImage::from_fn(8, 4, |x, y| {
+            image::Rgba([(x * 31) as u8, (y * 65) as u8, (x * y * 10) as u8, 255])
+        });
+        let mut encoder = FrameEncoder::default();
+        for (width, height) in [(8, 4), (4, 2), (10, 6)] {
+            for rotate in [false, true] {
+                for brightness in [1, 5, 10] {
+                    let settings = Settings {
+                        rotate,
+                        brightness,
+                        ..Default::default()
+                    };
+                    let mut expected = image::imageops::resize(
+                        &frame,
+                        width,
+                        height,
+                        image::imageops::FilterType::Triangle,
+                    );
+                    if rotate {
+                        expected = image::imageops::rotate180(&expected);
+                    }
+                    let factor = 1.0 + (brightness - 1) as f32 * 0.3;
+                    for pixel in expected.pixels_mut() {
+                        for channel in &mut pixel.0[..3] {
+                            *channel = (*channel as f32 * factor).min(255.0) as u8;
+                        }
+                    }
+                    let expected = image::DynamicImage::ImageRgba8(expected).to_rgb8();
+                    encoder.prepare_rgb(&frame, width, height, &settings);
+                    assert_eq!(encoder.rgb, expected);
+                    let pointer = encoder.rgb.as_raw().as_ptr();
+                    encoder.prepare_rgb(&frame, width, height, &settings);
+                    assert_eq!(
+                        encoder.rgb.as_raw().as_ptr(),
+                        pointer,
+                        "same-size frame should reuse RGB storage"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reusable_encoder_produces_valid_jpeg_after_frames_and_profile_changes() {
+        let frame = RgbaImage::from_pixel(16, 8, image::Rgba([30, 80, 160, 255]));
+        let mut encoder = FrameEncoder::default();
+        for (width, height) in [(16, 8), (8, 4), (16, 8)] {
+            let bytes = encoder
+                .encode(
+                    &frame,
+                    DeviceInfo {
+                        pm: 65,
+                        width,
+                        height,
+                    },
+                    &Settings::default(),
+                )
+                .unwrap();
+            assert!(bytes.len() <= protocol::MAX_JPEG);
+            let decoded = image::load_from_memory(bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (width, height));
+        }
+    }
 
     fn response(profile: u8) -> [u8; 512] {
         let mut response = [0; 512];

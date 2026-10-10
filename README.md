@@ -24,6 +24,8 @@ cargo run --release
 
 应用显示预览，自动尝试连接 LCD。右上工具栏可进入设置；关闭窗口后留在系统托盘，双击托盘图标重新打开，托盘菜单或工具栏的「退出」停止程序。
 
+Windows 预览按需运行在独立进程中；关闭窗口会退出预览进程，释放窗口、纹理和显卡驱动缓存。后台继续采集、轮播和输出 LCD，并接收系统电源通知。打开预览期间会看到两个同名进程，查看内存时需合计两者。
+
 ```powershell
 cargo run --release -- --preview       # 保持本机预览入口
 cargo run --release -- --demo          # 演示数据，仍可输出到 LCD
@@ -162,8 +164,11 @@ cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 python -m unittest discover -s tests -p "test_*.py"
+.\packaging\test-tray.ps1 # 先退出常驻实例；在交互式 Windows 桌面运行
 ```
 
 测试覆盖协议分包、JSONL 半行与替换、Token 去重、多来源独立会话、PID 复用、实例切换、不完整快照、原生登记身份校验、同目录多会话、状态过期、动态页面锚点、分页点击、奇数末页、空筛选、轮播暂停和设置迁移。PNG/GIF 导出可以验证无硬件渲染；USB 帧 ACK、驱动兼容、睡眠唤醒与温度需要在目标设备上验证。
+
+预览通信测试覆盖画面与状态传输、消息大小限制、截断数据和后台操作。托盘回归覆盖预览进程的销毁与重建、最小化恢复、预览崩溃后重开，以及退出时清理子进程。
 
 日志解析位于 `agents`，身份与状态归并 / 分页位于 `session`，来源调度位于 `monitor`，Windows / WSL2 探测位于 `probe`，Claude 原生登记校验位于 `src/probe/claude.rs`；系统指标、渲染与 USB 继续独立运行。素材来源和许可证见 [THIRD_PARTY.md](THIRD_PARTY.md)。

@@ -2,8 +2,8 @@ use crate::{
     metrics::Snapshot,
     session::{AgentSession, AgentSnapshot, OpenState, ViewMode, ViewState, WorkState},
 };
+use ab_glyph::{Font, FontArc, FontRef, PxScale, point};
 use anyhow::{Context, Result};
-use fontdue::{Font, FontSettings};
 use image::{RgbaImage, imageops};
 use std::{collections::HashMap, path::Path};
 use tiny_skia::{LineCap, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
@@ -21,6 +21,120 @@ const ORANGE: [u8; 3] = [251, 191, 36];
 const CYAN: [u8; 3] = [34, 211, 238];
 const PURPLE: [u8; 3] = [167, 139, 250];
 const RED: [u8; 3] = [239, 68, 68];
+const GLYPH_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const GLYPH_CACHE_ENTRIES: usize = 4096;
+
+type GlyphKey = (char, u16, usize);
+
+struct RasterGlyph {
+    advance: f32,
+    left: i32,
+    top: i32,
+    width: usize,
+    height: usize,
+    bitmap: Vec<u8>,
+}
+impl RasterGlyph {
+    fn new(font: &FontArc, ch: char, size: u16) -> Self {
+        let id = font.glyph_id(ch);
+        let mut glyph = Self {
+            advance: advance(font, ch, size),
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+            bitmap: Vec::new(),
+        };
+        if let Some(outline) =
+            font.outline_glyph(id.with_scale_and_position(font_scale(font, size), point(0.0, 0.0)))
+        {
+            let bounds = outline.px_bounds();
+            glyph.left = bounds.min.x as i32;
+            glyph.top = bounds.min.y as i32;
+            glyph.width = bounds.width() as usize;
+            glyph.height = bounds.height() as usize;
+            glyph.bitmap = vec![0; glyph.width * glyph.height];
+            outline.draw(|x, y, coverage| {
+                glyph.bitmap[y as usize * glyph.width + x as usize] =
+                    (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
+            });
+        }
+        glyph
+    }
+}
+
+// ab_glyph scales by ascent minus descent; dashboard sizes are pixels per em.
+fn font_scale(font: &FontArc, size: u16) -> PxScale {
+    PxScale::from(size as f32 * font.height_unscaled() / font.units_per_em().unwrap())
+}
+fn advance(font: &FontArc, ch: char, size: u16) -> f32 {
+    font.h_advance_unscaled(font.glyph_id(ch)) * size as f32 / font.units_per_em().unwrap()
+}
+
+struct CachedGlyph {
+    glyph: RasterGlyph,
+    last_used: u64,
+}
+struct GlyphCache {
+    entries: HashMap<GlyphKey, CachedGlyph>,
+    bytes: usize,
+    budget: usize,
+    clock: u64,
+    uncached: Option<RasterGlyph>,
+}
+impl GlyphCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            budget,
+            clock: 0,
+            uncached: None,
+        }
+    }
+    fn cost(glyph: &RasterGlyph) -> usize {
+        glyph.bitmap.capacity() + std::mem::size_of::<(GlyphKey, CachedGlyph)>()
+    }
+    fn get_or_insert_with(
+        &mut self,
+        key: GlyphKey,
+        load: impl FnOnce() -> RasterGlyph,
+    ) -> &RasterGlyph {
+        self.clock += 1;
+        self.uncached = None;
+        if !self.entries.contains_key(&key) {
+            let glyph = load();
+            let cost = Self::cost(&glyph);
+            // A single unusually large glyph must not exceed the cache budget.
+            if cost > self.budget {
+                self.uncached = Some(glyph);
+                return self.uncached.as_ref().unwrap();
+            }
+            while self.bytes + cost > self.budget || self.entries.len() >= GLYPH_CACHE_ENTRIES {
+                // Prefer retaining the Latin/digit glyphs used by fixed labels.
+                let oldest = *self
+                    .entries
+                    .iter()
+                    .min_by_key(|(key, entry)| (key.0.is_ascii(), entry.last_used))
+                    .unwrap()
+                    .0;
+                let removed = self.entries.remove(&oldest).unwrap();
+                self.bytes -= Self::cost(&removed.glyph);
+            }
+            self.bytes += cost;
+            self.entries.insert(
+                key,
+                CachedGlyph {
+                    glyph,
+                    last_used: self.clock,
+                },
+            );
+        }
+        let entry = self.entries.get_mut(&key).unwrap();
+        entry.last_used = self.clock;
+        &entry.glyph
+    }
+}
 fn color(pct: f32) -> [u8; 3] {
     if pct < 50.0 {
         GREEN
@@ -30,14 +144,15 @@ fn color(pct: f32) -> [u8; 3] {
         RED
     }
 }
+
 fn blend(bg: [u8; 3], fg: [u8; 3], alpha: f32) -> [u8; 3] {
     std::array::from_fn(|i| (bg[i] as f32 * (1.0 - alpha) + fg[i] as f32 * alpha) as u8)
 }
 
 pub struct Renderer {
     canvas: Pixmap,
-    fonts: Vec<Font>,
-    glyphs: HashMap<(char, u16, usize), (fontdue::Metrics, Vec<u8>)>,
+    fonts: Vec<FontArc>,
+    glyphs: GlyphCache,
     cat: RgbaImage,
     pika: RgbaImage,
 }
@@ -49,29 +164,43 @@ impl Renderer {
             .join("Fonts");
         let default_path = font_dir.join("msyh.ttc");
         let path = font_path.unwrap_or(&default_path);
-        let bytes = std::fs::read(path).with_context(|| {
-            format!(
-                "Cannot read font {}; configure a Chinese-capable TTF/TTC via settings.font",
+        let load_font = |path: &Path| -> Result<FontArc> {
+            let bytes = crate::fonts::bytes(path).with_context(|| {
+                format!(
+                    "Cannot read font {}; configure a Chinese-capable TTF/TTC via settings.font",
+                    path.display()
+                )
+            })?;
+            let font = FontRef::try_from_slice_and_index(bytes, 0)
+                .with_context(|| format!("Parsing font {}", path.display()))?;
+            anyhow::ensure!(
+                font.units_per_em().is_some(),
+                "Font has no em size: {}",
                 path.display()
-            )
-        })?;
+            );
+            Ok(FontArc::new(font))
+        };
+        let regular = load_font(path)?;
         // Default Latin and Chinese fonts have real regular/bold weights. An
         // explicit custom font applies to both scripts and takes precedence.
         let mut fonts = Vec::new();
         for name in ["msyh.ttc", "msyhbd.ttc", "segoeui.ttf", "segoeuib.ttf"] {
-            let data = if font_path.is_none() {
-                std::fs::read(font_dir.join(name)).unwrap_or_else(|_| bytes.clone())
+            let font = if font_path.is_none() && name != "msyh.ttc" {
+                let path = font_dir.join(name);
+                if path.exists() {
+                    load_font(&path)?
+                } else {
+                    regular.clone()
+                }
             } else {
-                bytes.clone()
+                regular.clone()
             };
-            fonts.push(
-                Font::from_bytes(data, FontSettings::default()).map_err(|e| anyhow::anyhow!(e))?,
-            );
+            fonts.push(font);
         }
         Ok(Self {
             canvas: Pixmap::new(1920, 480).context("Allocating dashboard")?,
             fonts,
-            glyphs: HashMap::new(),
+            glyphs: GlyphCache::new(GLYPH_CACHE_BYTES),
             cat: imageops::resize(
                 &image::load_from_memory(include_bytes!("../assets/BongoCat.png"))?.to_rgba8(),
                 148,
@@ -154,11 +283,7 @@ impl Renderer {
     }
     fn measure(&self, s: &str, size: u16, bold: bool) -> f32 {
         s.chars()
-            .map(|ch| {
-                self.fonts[Self::font_index(ch, bold)]
-                    .metrics(ch, size as f32)
-                    .advance_width
-            })
+            .map(|ch| advance(&self.fonts[Self::font_index(ch, bold)], ch, size))
             .sum()
     }
     fn text(&mut self, s: &str, pos: (f32, f32), size: u16, c: [u8; 3], width: f32, bold: bool) {
@@ -168,9 +293,7 @@ impl Renderer {
         let mut fitted = String::new();
         let mut used = 0.0;
         for ch in s.chars() {
-            let advance = self.fonts[Self::font_index(ch, bold)]
-                .metrics(ch, size as f32)
-                .advance_width;
+            let advance = advance(&self.fonts[Self::font_index(ch, bold)], ch, size);
             if used + advance > width - if truncated { ellipsis } else { 0.0 } {
                 break;
             }
@@ -183,20 +306,19 @@ impl Renderer {
         let mut cursor = x;
         for ch in fitted.chars() {
             let index = Self::font_index(ch, bold);
-            let (m, bitmap) = self
-                .glyphs
-                .entry((ch, size, index))
-                .or_insert_with(|| self.fonts[index].rasterize(ch, size as f32));
-            let gx = cursor as i32 + m.xmin;
-            let gy = y as i32 + size as i32 - m.height as i32 - m.ymin;
-            for row in 0..m.height {
-                for col in 0..m.width {
+            let glyph = self.glyphs.get_or_insert_with((ch, size, index), || {
+                RasterGlyph::new(&self.fonts[index], ch, size)
+            });
+            let gx = cursor as i32 + glyph.left;
+            let gy = y as i32 + size as i32 + glyph.top;
+            for row in 0..glyph.height {
+                for col in 0..glyph.width {
                     let px = gx + col as i32;
                     let py = gy + row as i32;
                     if !(0..1920).contains(&px) || !(0..480).contains(&py) {
                         continue;
                     }
-                    let alpha = bitmap[row * m.width + col] as u32;
+                    let alpha = glyph.bitmap[row * glyph.width + col] as u32;
                     if alpha == 0 {
                         continue;
                     }
@@ -209,7 +331,7 @@ impl Renderer {
                     }
                 }
             }
-            cursor += m.advance_width;
+            cursor += glyph.advance;
         }
     }
     fn right(&mut self, s: &str, edge: f32, y: f32, size: u16, c: [u8; 3], bold: bool) {
@@ -318,7 +440,8 @@ impl Renderer {
         self.electricity(114.0, pika_y + 66.0, s.cpu, t);
         self.keyboard();
         let mut frame =
-            RgbaImage::from_raw(1920, 480, self.canvas.data().to_vec()).expect("fixed canvas size");
+            image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(1920, 480, self.canvas.data_mut())
+                .expect("fixed canvas size");
         // Embedded artwork from the reference; attribution in THIRD_PARTY.md.
         if active && (t * 2.0) as u64 % 4 >= 2 {
             imageops::overlay(
@@ -331,11 +454,6 @@ impl Renderer {
             imageops::overlay(&mut frame, &self.pika, 48, pika_y as i64);
         }
         imageops::overlay(&mut frame, &self.cat, 1556, 256);
-        self.canvas = Pixmap::from_vec(
-            frame.into_raw(),
-            tiny_skia::IntSize::from_wh(1920, 480).unwrap(),
-        )
-        .unwrap();
         for i in 0..2 {
             let raised = active && ((t * 5.0) as usize + i).is_multiple_of(2);
             let y = if raised { 310.0 } else { 326.0 };
@@ -851,9 +969,7 @@ impl Renderer {
                 let mut wrapped = 0;
                 let mut clipped = false;
                 for (index, ch) in normalized.char_indices() {
-                    let advance = self.fonts[Self::font_index(ch, false)]
-                        .metrics(ch, 19.0)
-                        .advance_width;
+                    let advance = advance(&self.fonts[Self::font_index(ch, false)], ch, 19);
                     if used + advance > width {
                         if wrapped + 1 >= cap {
                             chunk.push_str(&normalized[index..]);
@@ -918,5 +1034,116 @@ fn activity(age: u64) -> String {
         format!("最近活动 {} 分钟前", age / 60)
     } else {
         format!("最近活动 {} 小时前", age / 3600)
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn glyph(bytes: usize) -> RasterGlyph {
+        RasterGlyph {
+            advance: 1.0,
+            left: 0,
+            top: 0,
+            width: bytes,
+            height: 1,
+            bitmap: vec![255; bytes],
+        }
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_glyph_and_prefers_fixed_labels() {
+        let cost = GlyphCache::cost(&glyph(16));
+        let mut cache = GlyphCache::new(cost * 2);
+        for ch in ['甲', '乙'] {
+            cache.get_or_insert_with((ch, 24, 0), || glyph(16));
+        }
+        cache.get_or_insert_with(('甲', 24, 0), || panic!("cached glyph must be reused"));
+        cache.get_or_insert_with(('丙', 24, 0), || glyph(16));
+        assert!(cache.entries.contains_key(&('甲', 24, 0)));
+        assert!(!cache.entries.contains_key(&('乙', 24, 0)));
+        assert_eq!(cache.bytes, cost * 2);
+
+        let mut cache = GlyphCache::new(cost * 2);
+        for ch in ['0', '甲', '乙'] {
+            cache.get_or_insert_with((ch, 24, 0), || glyph(16));
+        }
+        assert!(cache.entries.contains_key(&('0', 24, 0)));
+        assert!(!cache.entries.contains_key(&('甲', 24, 0)));
+    }
+
+    #[test]
+    fn cache_bounds_memory_and_metadata_during_character_churn() {
+        let mut cache = GlyphCache::new(GLYPH_CACHE_BYTES);
+        for codepoint in 0x4e00..0x4e00 + 6000 {
+            let ch = char::from_u32(codepoint).unwrap();
+            cache.get_or_insert_with((ch, 24, 0), || glyph(4096));
+            assert!(cache.bytes <= GLYPH_CACHE_BYTES);
+            assert!(cache.entries.len() <= GLYPH_CACHE_ENTRIES);
+        }
+        let mut cache = GlyphCache::new(GLYPH_CACHE_BYTES);
+        for codepoint in 0x4e00..0x4e00 + 6000 {
+            let ch = char::from_u32(codepoint).unwrap();
+            cache.get_or_insert_with((ch, 24, 0), || glyph(0));
+        }
+        assert_eq!(cache.entries.len(), GLYPH_CACHE_ENTRIES);
+    }
+
+    #[test]
+    fn oversized_glyph_is_drawable_without_displacing_the_cache() {
+        let cost = GlyphCache::cost(&glyph(16));
+        let mut cache = GlyphCache::new(cost);
+        cache.get_or_insert_with(('0', 24, 0), || glyph(16));
+        let oversized = cache.get_or_insert_with(('甲', 24, 0), || glyph(cost + 1));
+        assert_eq!(oversized.bitmap.len(), cost + 1);
+        assert_eq!(cache.bytes, cost);
+        assert_eq!(cache.entries.len(), 1);
+        cache.get_or_insert_with(('0', 24, 0), || panic!("cached glyph must be reused"));
+        assert!(cache.uncached.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn chinese_and_latin_fonts_preserve_em_size_and_baseline() {
+        let renderer = Renderer::new(None).unwrap();
+        for (ch, font_index) in [('中', 0), ('国', 1), ('A', 2), ('g', 3), (' ', 2)] {
+            let font = &renderer.fonts[font_index];
+            let raster = RasterGlyph::new(font, ch, 24);
+            assert!(raster.advance > 0.0);
+            if ch == ' ' {
+                assert!(raster.bitmap.is_empty());
+                assert!(raster.advance > 0.0);
+            } else {
+                assert!(raster.bitmap.iter().any(|&value| value > 0));
+                assert!(raster.top < 0, "glyph should extend above the baseline");
+                if ch == 'g' {
+                    assert!(
+                        raster.top + raster.height as i32 > 0,
+                        "descender must extend below the baseline"
+                    );
+                }
+            }
+            if !ch.is_ascii() {
+                assert!((raster.advance - 24.0).abs() < 0.001);
+            }
+        }
+        let font_path = std::env::var_os("WINDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap()
+            .join("Fonts/msyh.ttc");
+        let custom = Renderer::new(Some(&font_path)).unwrap();
+        let bytes = crate::fonts::bytes(&font_path).unwrap();
+        for font in &custom.fonts {
+            assert_eq!(
+                font.font_data().as_ptr(),
+                bytes.as_ptr(),
+                "renderer and UI must borrow the same font storage"
+            );
+        }
+        assert_eq!(
+            custom.measure("中Ag", 24, false),
+            custom.measure("中Ag", 24, true)
+        );
     }
 }

@@ -20,6 +20,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+mod preview;
+#[cfg(windows)]
+pub use preview::run_preview_client;
+
 pub struct InstanceGuard {
     #[cfg(windows)]
     handle: windows_sys::Win32::Foundation::HANDLE,
@@ -60,8 +65,10 @@ impl Drop for InstanceGuard {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Output {
-    frame: Option<image::RgbaImage>,
+    #[serde(skip)]
+    frame: Option<Arc<image::RgbaImage>>,
     sequence: u64,
     connected: bool,
     status: String,
@@ -84,6 +91,19 @@ impl Default for Output {
         }
     }
 }
+impl Output {
+    fn preview_frame(
+        &self,
+        hidden: bool,
+        uploaded_sequence: Option<u64>,
+    ) -> Option<Arc<image::RgbaImage>> {
+        if hidden || uploaded_sequence == Some(self.sequence) {
+            None
+        } else {
+            self.frame.clone()
+        }
+    }
+}
 struct Dashboard {
     settings: Settings,
     settings_path: PathBuf,
@@ -93,84 +113,126 @@ struct Dashboard {
     frame_view: ViewState,
     show_sessions: bool,
     output: Arc<Mutex<Output>>,
-    stop: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    repaint_target: RepaintTarget,
+    can_hide: bool,
+    #[cfg(windows)]
+    tray_actions: Arc<Mutex<Vec<TrayAction>>>,
+    #[cfg(windows)]
+    commands: Option<Arc<Mutex<std::io::Stdout>>>,
     texture: Option<egui::TextureHandle>,
     sequence: u64,
     error: String,
     show_settings: bool,
     hidden: bool,
-    force_preview: bool,
-    startup_decided: bool,
-    last_connected: bool,
-    last_night: bool,
     quit: bool,
+}
+
+#[derive(Clone)]
+struct RepaintWindow {
+    ctx: egui::Context,
+    #[cfg(windows)]
+    window: NativeWindow,
+}
+
+#[cfg(windows)]
+struct BackgroundWindow(windows_sys::Win32::Foundation::HWND);
+#[cfg(windows)]
+impl BackgroundWindow {
+    fn new() -> Result<Self> {
+        use windows_sys::{Win32::UI::WindowsAndMessaging::CreateWindowExW, core::w};
+        // A hidden top-level window receives power broadcasts; a message-only
+        // window would miss suspend/resume. It never creates a graphics context.
+        let window = unsafe {
+            CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("Thermalright background"),
+                0,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        anyhow::ensure!(
+            !window.is_null(),
+            "Creating background notification window failed: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(Self(window))
+    }
+}
+#[cfg(windows)]
+impl Drop for BackgroundWindow {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(self.0);
+        }
+    }
+}
+#[cfg(windows)]
+fn pump_messages() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+    };
+    let mut message = MSG::default();
+    while unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+        unsafe {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+type RepaintTarget = Arc<Mutex<Option<RepaintWindow>>>;
+
+struct Runtime {
+    settings_path: PathBuf,
+    shared_settings: Arc<Mutex<Settings>>,
+    agents: Arc<Mutex<AgentSnapshot>>,
+    view: Arc<Mutex<ViewState>>,
+    output: Arc<Mutex<Output>>,
+    stop: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    workers: Vec<JoinHandle<()>>,
+    repaint_target: RepaintTarget,
+    error: String,
+    #[cfg(windows)]
+    remote: bool,
+    #[cfg(windows)]
+    remote_can_hide: bool,
+    #[cfg(windows)]
+    remote_actions: Arc<Mutex<Vec<TrayAction>>>,
     #[cfg(windows)]
     tray: Option<Tray>,
     #[cfg(windows)]
     _display_power: Option<crate::power::DisplayPower>,
+    #[cfg(windows)]
+    _background_window: Option<BackgroundWindow>,
 }
-
-pub fn run(args: Args, settings: Settings) -> Result<()> {
-    let _instance = InstanceGuard::acquire()?;
-    // Fail before starting workers if the required font/art assets cannot be loaded.
-    let renderer = Renderer::new(settings.font.as_deref())?;
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(APP_NAME)
-            .with_inner_size([1280.0, 400.0])
-            .with_min_inner_size([800.0, 300.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        APP_NAME,
-        options,
-        Box::new(move |cc| {
-            let default_font = std::env::var_os("WINDIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "C:/Windows".into())
-                .join("Fonts/msyh.ttc");
-            if let Ok(bytes) = std::fs::read(settings.font.as_deref().unwrap_or(&default_font)) {
-                let mut fonts = egui::FontDefinitions::default();
-                fonts.font_data.insert(
-                    "chinese".into(),
-                    Arc::new(egui::FontData::from_owned(bytes)),
-                );
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, "chinese".into());
-                cc.egui_ctx.set_fonts(fonts);
-            }
-            Ok(Box::new(Dashboard::new(args, settings, renderer, cc)))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("Window error: {e}"))
-}
-
-impl Dashboard {
-    fn new(
-        args: Args,
-        settings: Settings,
-        mut renderer: Renderer,
-        cc: &eframe::CreationContext<'_>,
-    ) -> Self {
-        let ctx = cc.egui_ctx.clone();
+impl Runtime {
+    fn new(args: &Args, settings: Settings, mut renderer: Renderer) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let output = Arc::new(Mutex::new(Output::default()));
-        let shared_settings = Arc::new(Mutex::new(settings.clone()));
+        let shared_settings = Arc::new(Mutex::new(settings));
         let agents = Arc::new(Mutex::new(AgentSnapshot::default()));
         let view = Arc::new(Mutex::new(ViewState::default()));
+        let repaint_target: RepaintTarget = Arc::new(Mutex::new(None));
         let display_state = Arc::new(crate::power::DisplayState::default());
         #[cfg(windows)]
-        let (display_power, power_error) = match NativeWindow::from_context(cc).and_then(|window| {
-            crate::power::DisplayPower::new(window.0 as _, display_state.clone())
-        }) {
-            Ok(monitor) => (Some(monitor), String::new()),
-            Err(e) => (None, format!("Display power sync unavailable: {e:#}")),
-        };
+        let background_window = BackgroundWindow::new()?;
+        #[cfg(windows)]
+        let (display_power, power_error) =
+            match crate::power::DisplayPower::new(background_window.0, display_state.clone()) {
+                Ok(monitor) => (Some(monitor), String::new()),
+                Err(error) => (None, format!("Display power sync unavailable: {error:#}")),
+            };
         let home = args.agent_home.clone().unwrap_or_else(|| {
             directories::UserDirs::new()
                 .map(|d| d.home_dir().to_path_buf())
@@ -222,7 +284,7 @@ impl Dashboard {
             let stop = stop.clone();
             let output = output.clone();
             let shared_settings = shared_settings.clone();
-            let ctx = ctx.clone();
+            let repaint_target = repaint_target.clone();
             let agents = agents.clone();
             let view = view.clone();
             thread::spawn(move || {
@@ -308,7 +370,7 @@ impl Dashboard {
                     frames += 1;
                     {
                         let mut state = output.lock().unwrap();
-                        state.frame = Some(frame);
+                        state.frame = Some(Arc::new(frame));
                         state.view = current_view;
                         state.sequence += 1;
                         state.night = night;
@@ -319,7 +381,9 @@ impl Dashboard {
                             fps_start = Instant::now();
                         }
                     }
-                    ctx.request_repaint();
+                    if let Some(target) = repaint_target.lock().unwrap().as_ref() {
+                        target.ctx.request_repaint();
+                    }
                     let interval = if blank {
                         Duration::from_secs(3)
                     } else if snapshot.animated() {
@@ -342,27 +406,25 @@ impl Dashboard {
                 }
             })
         };
+
         #[cfg(windows)]
-        let (tray, tray_error) = match Tray::new(&ctx, cc) {
-            Ok(t) => (Some(t), String::new()),
-            Err(e) => (None, format!("Tray unavailable: {e}")),
+        let (tray, tray_error) = match Tray::new(&repaint_target) {
+            Ok(tray) => (Some(tray), String::new()),
+            Err(error) => (None, format!("Tray unavailable: {error:#}")),
         };
-        Self {
-            settings,
-            settings_path: args.config.unwrap_or_else(Settings::path),
+        Ok(Self {
+            settings_path: args.config.clone().unwrap_or_else(Settings::path),
             shared_settings,
             agents,
             view,
-            frame_view: ViewState::default(),
-            show_sessions: false,
             output,
             stop,
+            shutdown,
+            repaint_target,
             workers: [Some(metric_worker), Some(display_worker), agent_worker]
                 .into_iter()
                 .flatten()
                 .collect(),
-            texture: None,
-            sequence: 0,
             #[cfg(windows)]
             error: [tray_error, power_error]
                 .into_iter()
@@ -371,17 +433,198 @@ impl Dashboard {
                 .join("\n"),
             #[cfg(not(windows))]
             error: String::new(),
-            show_settings: false,
-            hidden: false,
-            force_preview: args.preview,
-            startup_decided: !args.background,
-            last_connected: false,
-            last_night: false,
-            quit: false,
             #[cfg(windows)]
             tray,
             #[cfg(windows)]
             _display_power: display_power,
+            #[cfg(windows)]
+            _background_window: Some(background_window),
+            #[cfg(windows)]
+            remote: false,
+            #[cfg(windows)]
+            remote_can_hide: false,
+            #[cfg(windows)]
+            remote_actions: Arc::default(),
+        })
+    }
+    fn can_hide(&self) -> bool {
+        #[cfg(windows)]
+        {
+            if self.remote {
+                self.remote_can_hide
+            } else {
+                self.tray.is_some()
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+}
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        *self.repaint_target.lock().unwrap() = None;
+        self.stop.store(true, Ordering::Relaxed);
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+pub fn run(args: Args, settings: Settings) -> Result<()> {
+    let _instance = InstanceGuard::acquire()?;
+    let renderer = Renderer::new(settings.font.as_deref())?;
+    let runtime = Runtime::new(&args, settings, renderer)?;
+    let mut show_preview = !args.background || args.preview || !runtime.can_hide();
+    let mut startup_decided = show_preview;
+    let mut last_connected = false;
+    let mut last_night = false;
+    #[cfg(windows)]
+    let mut preview_process: Option<preview::PreviewProcess> = None;
+    while !runtime.shutdown.load(Ordering::Relaxed) {
+        #[cfg(windows)]
+        pump_messages();
+        let mut show_settings = false;
+        #[cfg(windows)]
+        for action in runtime.tray.as_ref().map(Tray::actions).unwrap_or_default() {
+            if let Some(preview) = &preview_process {
+                match action {
+                    TrayAction::Preview => preview.request(preview::UiRequest::Preview),
+                    TrayAction::Settings => preview.request(preview::UiRequest::Settings),
+                    TrayAction::Quit => runtime.shutdown.store(true, Ordering::Relaxed),
+                }
+                continue;
+            }
+            match action {
+                TrayAction::Preview => show_preview = true,
+                TrayAction::Settings => {
+                    show_preview = true;
+                    show_settings = true;
+                }
+                TrayAction::Quit => runtime.shutdown.store(true, Ordering::Relaxed),
+            }
+        }
+        if runtime.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        #[cfg(windows)]
+        if let Some(preview) = &mut preview_process {
+            preview.apply_commands(&runtime);
+            if preview.exited()? {
+                preview.apply_commands(&runtime);
+                preview_process = None;
+                let output = runtime.output.lock().unwrap();
+                last_connected = output.connected;
+                last_night = output.night;
+            }
+        }
+        {
+            let output = runtime.output.lock().unwrap();
+            if !startup_decided && output.sequence > 0 {
+                startup_decided = true;
+                show_preview |= !output.connected;
+            }
+            show_preview |= (last_connected && !output.connected) || (!last_night && output.night);
+            last_connected = output.connected;
+            last_night = output.night;
+        }
+        if show_preview {
+            show_preview = false;
+            #[cfg(windows)]
+            {
+                if preview_process.is_none() {
+                    preview_process =
+                        Some(preview::PreviewProcess::spawn(&runtime, show_settings)?);
+                }
+            }
+            #[cfg(not(windows))]
+            run_preview(&runtime, show_settings)?;
+            // Changes seen while the preview was open must not reopen it on hide.
+            let output = runtime.output.lock().unwrap();
+            last_connected = output.connected;
+            last_night = output.night;
+            startup_decided = true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
+fn run_preview(runtime: &Runtime, show_settings: bool) -> Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(APP_NAME)
+            .with_inner_size([1280.0, 400.0])
+            .with_min_inner_size([800.0, 300.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        APP_NAME,
+        options,
+        Box::new(move |cc| {
+            let settings = runtime.shared_settings.lock().unwrap().clone();
+            let default_font = std::env::var_os("WINDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "C:/Windows".into())
+                .join("Fonts/msyh.ttc");
+            if let Ok(bytes) =
+                crate::fonts::bytes(settings.font.as_deref().unwrap_or(&default_font))
+            {
+                let mut fonts = egui::FontDefinitions::default();
+                fonts.font_data.insert(
+                    "chinese".into(),
+                    Arc::new(egui::FontData::from_static(bytes)),
+                );
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "chinese".into());
+                cc.egui_ctx.set_fonts(fonts);
+            }
+            let dashboard = Dashboard::new(runtime, settings, show_settings);
+            *runtime.repaint_target.lock().unwrap() = Some(RepaintWindow {
+                ctx: cc.egui_ctx.clone(),
+                #[cfg(windows)]
+                window: NativeWindow::from_context(cc)?,
+            });
+            Ok(Box::new(dashboard))
+        }),
+    )
+    .map_err(|error| anyhow::anyhow!("Window error: {error}"))
+}
+
+impl Dashboard {
+    fn new(runtime: &Runtime, settings: Settings, show_settings: bool) -> Self {
+        Self {
+            settings,
+            settings_path: runtime.settings_path.clone(),
+            shared_settings: runtime.shared_settings.clone(),
+            agents: runtime.agents.clone(),
+            view: runtime.view.clone(),
+            output: runtime.output.clone(),
+            shutdown: runtime.shutdown.clone(),
+            repaint_target: runtime.repaint_target.clone(),
+            can_hide: runtime.can_hide(),
+            #[cfg(windows)]
+            tray_actions: runtime
+                .tray
+                .as_ref()
+                .map(|tray| tray.pending.clone())
+                .unwrap_or_else(|| runtime.remote_actions.clone()),
+            #[cfg(windows)]
+            commands: runtime
+                .remote
+                .then(|| Arc::new(Mutex::new(std::io::stdout()))),
+            frame_view: ViewState::default(),
+            show_sessions: false,
+            texture: None,
+            sequence: 0,
+            error: runtime.error.clone(),
+            show_settings,
+            hidden: false,
+            quit: false,
         }
     }
     fn visible(&mut self, ctx: &egui::Context, visible: bool) {
@@ -389,22 +632,30 @@ impl Dashboard {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
         if visible {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+        } else {
+            self.texture = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
     fn can_hide(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self.tray.is_some()
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
+        self.can_hide
     }
     fn save(&mut self) {
         *self.shared_settings.lock().unwrap() = self.settings.clone();
+        #[cfg(windows)]
+        self.command(preview::ClientCommand::Settings(self.settings.clone()));
         if let Err(e) = self.settings.save(&self.settings_path) {
             self.error = e.to_string();
+        }
+    }
+    #[cfg(windows)]
+    fn command(&mut self, command: preview::ClientCommand) {
+        if let Some(commands) = &self.commands
+            && let Err(error) = preview::send_command(&mut *commands.lock().unwrap(), &command)
+        {
+            self.error = format!("后台连接已断开：{error}");
+            self.quit = true;
         }
     }
     fn settings_ui(&mut self, ctx: &egui::Context) {
@@ -485,8 +736,13 @@ impl eframe::App for Dashboard {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(windows)]
         {
-            let actions = self.tray.as_ref().map(|t| t.actions()).unwrap_or_default();
+            let actions: Vec<_> = self.tray_actions.lock().unwrap().drain(..).collect();
             for action in actions {
+                if !matches!(action, TrayAction::Quit)
+                    && let Some(target) = self.repaint_target.lock().unwrap().clone()
+                {
+                    target.window.restore(true);
+                }
                 match action {
                     TrayAction::Preview => self.visible(ctx, true),
                     TrayAction::Settings => {
@@ -497,28 +753,23 @@ impl eframe::App for Dashboard {
                 }
             }
         }
-        if self.quit {
+        if self.quit || self.shutdown.load(Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.can_hide() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.visible(ctx, false);
+            self.hidden = true;
+            return;
         }
-        let (connected, status, fps, night, system_off, sequence, frame, frame_view) = {
+        let (status, fps, night, system_off, sequence, frame, frame_view) = {
             let output = self.output.lock().unwrap();
             (
-                output.connected,
                 output.status.clone(),
                 output.fps,
                 output.night,
                 output.system_off,
                 output.sequence,
-                if output.sequence != self.sequence {
-                    output.frame.clone()
-                } else {
-                    None
-                },
+                output.preview_frame(self.hidden, self.texture.as_ref().map(|_| self.sequence)),
                 output.view.clone(),
             )
         };
@@ -533,17 +784,6 @@ impl eframe::App for Dashboard {
             }
             self.sequence = sequence;
         }
-        if !self.startup_decided && sequence > 0 {
-            self.startup_decided = true;
-            if connected && !self.force_preview && self.can_hide() {
-                self.visible(ctx, false);
-            }
-        }
-        if self.hidden && ((!connected && self.last_connected) || (night && !self.last_night)) {
-            self.visible(ctx, true);
-        }
-        self.last_connected = connected;
-        self.last_night = night;
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.strong(APP_NAME);
@@ -641,6 +881,8 @@ impl eframe::App for Dashboard {
                 for (delta, label) in [(-1, "上一页"), (1, "下一页")] {
                     if ui.button(label).clicked() {
                         self.view.lock().unwrap().advance(delta, Instant::now());
+                        #[cfg(windows)]
+                        self.command(preview::ClientCommand::Advance(delta));
                     }
                 }
                 changed |= ui
@@ -683,8 +925,10 @@ impl eframe::App for Dashboard {
                     let mut view = self.frame_view.clone();
                     if view.click(x, y, Instant::now()) {
                         self.settings.agent_view = view.preferences.clone();
-                        *self.view.lock().unwrap() = view;
+                        *self.view.lock().unwrap() = view.clone();
                         self.save();
+                        #[cfg(windows)]
+                        self.command(preview::ClientCommand::View(view));
                     }
                 }
             } else {
@@ -727,9 +971,11 @@ impl eframe::App for Dashboard {
 }
 impl Drop for Dashboard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
+        *self.repaint_target.lock().unwrap() = None;
+        if self.quit || !self.can_hide() {
+            #[cfg(windows)]
+            self.command(preview::ClientCommand::Quit);
+            self.shutdown.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -773,7 +1019,7 @@ struct Tray {
 }
 #[cfg(windows)]
 impl Tray {
-    fn new(ctx: &egui::Context, cc: &eframe::CreationContext<'_>) -> Result<Self> {
+    fn new(repaint_target: &RepaintTarget) -> Result<Self> {
         use tray_icon::{
             Icon, TrayIconBuilder, TrayIconEvent,
             menu::{Menu, MenuEvent, MenuItem},
@@ -784,15 +1030,13 @@ impl Tray {
         let quit = MenuItem::new("退出", true, None);
         menu.append_items(&[&preview, &settings, &quit])?;
         let pending = Arc::new(Mutex::new(Vec::new()));
-        let window = NativeWindow::from_context(cc)?;
         let preview_id = preview.id().clone();
         let settings_id = settings.id().clone();
         let quit_id = quit.id().clone();
-        // Hidden Win32 windows do not receive the redraw needed to run App::update.
-        // Restore the HWND in the native tray callback before asking egui to repaint.
-        // Install handlers before creating the icon, since these libraries' handlers
-        // are initialized once, including when their first event is delivered.
-        let wake = ctx.clone();
+        // The tray belongs to the background runtime. With no preview, the outer
+        // message pump consumes these actions; an existing preview is restored.
+        // Install handlers before creating the icon: they are initialized once.
+        let wake = repaint_target.clone();
         let events = pending.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let action = if event.id == preview_id {
@@ -806,16 +1050,20 @@ impl Tray {
             };
             let focus = !matches!(action, TrayAction::Quit);
             events.lock().unwrap().push(action);
-            window.restore(focus);
-            wake.request_repaint();
+            if let Some(target) = wake.lock().unwrap().as_ref() {
+                target.window.restore(focus);
+                target.ctx.request_repaint();
+            }
         }));
-        let wake = ctx.clone();
+        let wake = repaint_target.clone();
         let events = pending.clone();
         TrayIconEvent::set_event_handler(Some(move |event| {
             if matches!(event, TrayIconEvent::DoubleClick { .. }) {
                 events.lock().unwrap().push(TrayAction::Preview);
-                window.restore(true);
-                wake.request_repaint();
+                if let Some(target) = wake.lock().unwrap().as_ref() {
+                    target.window.restore(true);
+                    target.ctx.request_repaint();
+                }
             }
         }));
         let mut pixels = vec![0; 32 * 32 * 4];
@@ -931,6 +1179,33 @@ fn display_time(timestamp: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_skips_hidden_frames_and_restores_the_latest_shared_frame() {
+        let first = Arc::new(image::RgbaImage::new(2, 1));
+        let mut output = Output {
+            frame: Some(first.clone()),
+            sequence: 1,
+            ..Default::default()
+        };
+        assert!(output.preview_frame(true, None).is_none());
+        let frame = output.preview_frame(false, None).unwrap();
+        assert!(Arc::ptr_eq(&frame, &first));
+        assert!(output.preview_frame(false, Some(1)).is_none());
+        let latest = Arc::new(image::RgbaImage::new(2, 1));
+        output.frame = Some(latest.clone());
+        output.sequence = 2;
+        assert!(output.preview_frame(true, Some(1)).is_none());
+        assert!(Arc::ptr_eq(
+            &output.preview_frame(false, Some(1)).unwrap(),
+            &latest
+        ));
+        // Reopening after releasing the texture must upload even an unchanged frame.
+        assert!(Arc::ptr_eq(
+            &output.preview_frame(false, None).unwrap(),
+            &latest
+        ));
+    }
 
     #[test]
     fn display_power_changes_interrupt_the_frame_interval() {
