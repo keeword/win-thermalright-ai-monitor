@@ -402,9 +402,12 @@ pub fn windows_probe() -> anyhow::Result<ProbeResult> {
         if *kind == AgentKind::Codex {
             match windows_handles::codex_handles(pid.as_u32(), started) {
                 Ok(found) => {
+                    if shared_server && identity_confirmed && !found.has_rollout {
+                        continue;
+                    }
                     // Only a CLI without its own rollout can be a duplicate frontend.
                     // Failed inspections and ambiguous rollout owners stay visible.
-                    if !shared_server && found.rollouts.is_empty() {
+                    if !shared_server && !found.has_rollout {
                         frontend_peers.insert(key.clone(), found.unix_peer_pids);
                     }
                     paths = found.rollouts;

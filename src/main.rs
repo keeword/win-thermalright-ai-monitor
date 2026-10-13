@@ -61,7 +61,7 @@ pub struct Args {
     /// Read agent logs from a different home directory.
     #[arg(long)]
     agent_home: Option<PathBuf>,
-    /// Run hidden in the system tray until disconnected or opened.
+    /// Start hidden in the system tray.
     #[arg(long)]
     background: bool,
     /// Print local system/agent availability without opening a window or USB.

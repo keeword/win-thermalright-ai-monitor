@@ -37,10 +37,10 @@ impl Snapshot {
         let mut agents = AgentSnapshot::default();
         for kind in AgentKind::ALL {
             let usage = Usage {available:true,project:"win-thermalright-ai-monitor".into(),
-                message:match kind {AgentKind::Cursor=>"正在移植 Windows 实时仪表盘。\n\n| 模块 | 状态 |\n|---|---|\n| USB 协议 | 已完成 |\n| 系统监控 | 已完成 |\n| AI 面板 | 正在验证 |\n\n下一步：验证预览和硬件连接。",AgentKind::Codex=>"已完成 Rust USB 驱动与日志采集。\n\n• 增量读取本地会话记录\n• 今日 Token 用量与计划进度\n• 自动重连与自适应帧率\n\n正在执行构建和集成测试。",AgentKind::Claude=>"正在检查 Windows 原生实现。\n本地日志解析与图像渲染已就绪。"}.into(),
-                model:match kind {AgentKind::Claude=>"claude-sonnet-4",AgentKind::Codex=>"gpt-5-codex",AgentKind::Cursor=>"auto"}.into(),
+                message:match kind {AgentKind::Codex=>"已完成 Rust USB 驱动与日志采集。\n\n• 增量读取本地会话记录\n• 今日 Token 用量与计划进度\n• 自动重连与自适应帧率\n\n正在执行构建和集成测试。",AgentKind::Claude=>"正在检查 Windows 原生实现。\n本地日志解析与图像渲染已就绪。"}.into(),
+                model:match kind {AgentKind::Claude=>"claude-sonnet-4",AgentKind::Codex=>"gpt-5-codex"}.into(),
                 input:12_480_000,output:186_400,working:true,age:2,quota_used:if kind==AgentKind::Codex {Some(23.0)} else {None},
-                quota_reset:Some(chrono::Local::now().timestamp()+7200),context_used:Some(42.0),
+                quota_reset:Some(chrono::Local::now().timestamp()+7200),
                 plan:Some(Plan {current:4,total:6,completed:3,text:"验证 Windows 预览与 USB 输出".into()}),..Usage::default()};
             for n in 0..3 {
                 let mut usage = usage.clone();
@@ -98,7 +98,6 @@ impl Snapshot {
             ..Default::default()
         })
         .collect();
-        agents.origins_ready = true;
         agents.daily_usage = DailyUsage {
             available: true,
             day: chrono::Local::now().date_naive().to_string(),

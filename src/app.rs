@@ -100,6 +100,21 @@ impl Output {
         }
     }
 }
+fn display_frame(
+    blank: bool,
+    connected: bool,
+    preview_active: bool,
+    black: &Arc<image::RgbaImage>,
+    render: impl FnOnce() -> image::RgbaImage,
+) -> Option<Arc<image::RgbaImage>> {
+    if blank {
+        Some(black.clone())
+    } else if connected || preview_active {
+        Some(Arc::new(render()))
+    } else {
+        None
+    }
+}
 struct Dashboard {
     settings: Settings,
     settings_path: PathBuf,
@@ -210,6 +225,8 @@ struct Runtime {
     #[cfg(windows)]
     tray: Option<Tray>,
     #[cfg(windows)]
+    preview_active: Arc<AtomicBool>,
+    #[cfg(windows)]
     _display_power: Option<crate::power::DisplayPower>,
     #[cfg(windows)]
     _background_window: Option<BackgroundWindow>,
@@ -224,6 +241,7 @@ impl Runtime {
         let agents = Arc::new(Mutex::new(AgentSnapshot::default()));
         let view = Arc::new(Mutex::new(ViewState::default()));
         let repaint_target: RepaintTarget = Arc::new(Mutex::new(None));
+        let preview_active = Arc::new(AtomicBool::new(cfg!(not(windows))));
         let display_state = Arc::new(crate::power::DisplayState::default());
         #[cfg(windows)]
         let (background_window, window_error) = match BackgroundWindow::new() {
@@ -288,7 +306,13 @@ impl Runtime {
             let repaint_target = repaint_target.clone();
             let agents = agents.clone();
             let view = view.clone();
+            let preview_active = preview_active.clone();
             thread::spawn(move || {
+                let black = Arc::new(image::RgbaImage::from_pixel(
+                    1920,
+                    480,
+                    image::Rgba([0, 0, 0, 255]),
+                ));
                 let mut lcd: Option<Lcd> = None;
                 let mut retry = Instant::now();
                 let start = Instant::now();
@@ -338,42 +362,37 @@ impl Runtime {
                     let off =
                         settings.follow_system_display && display_state.off.load(Ordering::Relaxed);
                     let blank = night || off || suspended;
+                    let preview = preview_active.load(Ordering::Relaxed);
                     let current_view = {
                         let mut view = view.lock().unwrap();
                         view.sync(&snapshot.agents, &settings.agent_view, tick, blank);
                         view.clone()
                     };
-                    let frame = renderer.render_view(
-                        &snapshot,
-                        &current_view,
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if let Some(device) = &mut lcd {
-                        let black;
-                        let send_frame = if blank {
-                            black = image::RgbaImage::from_pixel(
-                                1920,
-                                480,
-                                image::Rgba([0, 0, 0, 255]),
-                            );
-                            &black
-                        } else {
-                            &frame
-                        };
-                        if let Err(e) = device.send(send_frame, &settings) {
-                            let mut state = output.lock().unwrap();
-                            state.connected = false;
-                            state.status = format!("USB disconnected: {e:#}");
-                            lcd = None;
-                            retry = Instant::now() + Duration::from_secs(3);
-                        }
-                    }
-                    frames += 1;
+                    let frame = display_frame(blank, lcd.is_some(), preview, &black, || {
+                        renderer.render_view(
+                            &snapshot,
+                            &current_view,
+                            start.elapsed().as_secs_f64(),
+                        )
+                    });
+                    if let Some(device) = &mut lcd
+                        && let Some(frame) = &frame
+                        && let Err(e) = device.send(frame, &settings)
                     {
                         let mut state = output.lock().unwrap();
-                        state.frame = Some(Arc::new(frame));
+                        state.connected = false;
+                        state.status = format!("USB disconnected: {e:#}");
+                        lcd = None;
+                        retry = Instant::now() + Duration::from_secs(3);
+                    }
+                    frames += usize::from(frame.is_some());
+                    {
+                        let mut state = output.lock().unwrap();
+                        if frame.is_some() {
+                            state.sequence += 1;
+                        }
+                        state.frame = frame;
                         state.view = current_view;
-                        state.sequence += 1;
                         state.night = night;
                         state.system_off = off;
                         if fps_start.elapsed() >= Duration::from_secs(1) {
@@ -385,7 +404,7 @@ impl Runtime {
                     if let Some(target) = repaint_target.lock().unwrap().as_ref() {
                         target.ctx.request_repaint();
                     }
-                    let interval = if blank {
+                    let interval = if blank || (lcd.is_none() && !preview) {
                         Duration::from_secs(3)
                     } else if snapshot.animated() {
                         Duration::from_secs_f64(1.0 / 15.0)
@@ -397,6 +416,7 @@ impl Runtime {
                         interval.saturating_sub(tick.elapsed()),
                         || {
                             display_state.generation.load(Ordering::Relaxed) == generation
+                                && preview_active.load(Ordering::Relaxed) == preview
                                 && display_state.suspended.load(Ordering::Relaxed) == suspended
                                 && shared_settings.lock().unwrap().follow_system_display
                                     == settings.follow_system_display
@@ -452,6 +472,8 @@ impl Runtime {
             #[cfg(windows)]
             tray,
             #[cfg(windows)]
+            preview_active,
+            #[cfg(windows)]
             _display_power: display_power,
             #[cfg(windows)]
             _background_window: background_window,
@@ -477,8 +499,6 @@ pub fn run(args: Args, settings: Settings) -> Result<()> {
     {
         let mut wanted = !args.background || args.preview || !runtime.ui.can_hide;
         let mut settings_wanted = false;
-        let mut startup_decided = wanted;
-        let (mut last_connected, mut last_night) = (false, false);
         let mut process: Option<preview::PreviewProcess> = None;
         let mut retry = preview::SpawnRetry::default();
         while !runtime.ui.shutdown.load(Ordering::Relaxed) {
@@ -499,9 +519,6 @@ pub fn run(args: Args, settings: Settings) -> Result<()> {
                                 .any(|request| matches!(request, preview::UiRequest::Settings));
                         }
                         process = None;
-                        let output = runtime.ui.output.lock().unwrap();
-                        last_connected = output.connected;
-                        last_night = output.night;
                     }
                     Ok(false) => {}
                     Err(error) => {
@@ -544,16 +561,6 @@ pub fn run(args: Args, settings: Settings) -> Result<()> {
             if runtime.ui.shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            {
-                let output = runtime.ui.output.lock().unwrap();
-                if !startup_decided && output.sequence > 0 {
-                    startup_decided = true;
-                    wanted |= !output.connected;
-                }
-                wanted |= (last_connected && !output.connected) || (!last_night && output.night);
-                last_connected = output.connected;
-                last_night = output.night;
-            }
             if wanted && let Some(child) = &mut process {
                 child.request(preview::UiRequest::Preview);
                 wanted = false;
@@ -575,8 +582,10 @@ pub fn run(args: Args, settings: Settings) -> Result<()> {
                         }
                     }
                 }
-                startup_decided = true;
             }
+            runtime
+                .preview_active
+                .store(process.is_some(), Ordering::Relaxed);
             thread::sleep(Duration::from_millis(25));
         }
     }
@@ -753,10 +762,7 @@ impl Dashboard {
                 .changed();
         }
         changed |= ui
-            .checkbox(
-                &mut self.settings.night_enabled,
-                "夜间熄屏（本机预览继续运行）",
-            )
+            .checkbox(&mut self.settings.night_enabled, "夜间熄屏")
             .changed();
         ui.horizontal(|ui| {
             ui.label("熄屏时间");
@@ -777,7 +783,7 @@ impl Dashboard {
         }
         ui.separator();
         ui.label("CPU 温度：运行 LibreHardwareMonitor 并启用 WMI。");
-        ui.label("额度来自 Codex 本地日志；Cursor 不提供 Token 用量。");
+        ui.label("额度来自 Codex 本地日志。");
         ui.label("配置文件：");
         ui.label(self.settings_path.display().to_string());
         if changed {
@@ -871,9 +877,19 @@ impl eframe::App for Dashboard {
                     (ViewMode::Overview, "总览"),
                     (ViewMode::Details, "详情"),
                 ] {
-                    changed |= ui
-                        .selectable_value(&mut self.settings.agent_view.mode, mode, label)
-                        .changed();
+                    if ui
+                        .selectable_label(
+                            self.frame_view
+                                .temporary_mode
+                                .unwrap_or(self.settings.agent_view.mode)
+                                == mode,
+                            label,
+                        )
+                        .clicked()
+                    {
+                        self.settings.agent_view.mode = mode;
+                        changed = true;
+                    }
                 }
                 egui::ComboBox::from_id_salt("agent-filter")
                     .selected_text(format!("Agent: {}", self.settings.agent_view.agent_filter))
@@ -900,8 +916,20 @@ impl eframe::App for Dashboard {
                     .origins
                     .iter()
                     .find(|o| o.origin_id == self.settings.agent_view.origin_filter)
-                    .map(|o| o.display_name.as_str())
-                    .unwrap_or("全部来源");
+                    .map(|o| {
+                        if o.status == "已停止" {
+                            format!("{}（暂不可用）", o.display_name)
+                        } else {
+                            o.display_name.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        if self.settings.agent_view.origin_filter == "all" {
+                            "全部来源".into()
+                        } else {
+                            format!("{}（暂不可用）", self.settings.agent_view.origin_filter)
+                        }
+                    });
                 egui::ComboBox::from_id_salt("origin-filter")
                     .selected_text(origin_name)
                     .show_ui(ui, |ui| {
@@ -922,17 +950,6 @@ impl eframe::App for Dashboard {
                                 .changed();
                         }
                     });
-                if self.settings.agent_view.origin_filter != "all"
-                    && agents.origins_ready
-                    && !agents.origins.iter().any(|o| {
-                        o.origin_id == self.settings.agent_view.origin_filter
-                            && o.status != "已停止"
-                    })
-                {
-                    self.settings.agent_view.origin_filter = "all".into();
-                    self.error = "保存的来源已不存在，已恢复全部来源。".into();
-                    changed = true;
-                }
                 for (delta, label) in [(-1, "上一页"), (1, "下一页")] {
                     if ui.button(label).clicked() {
                         self.view.lock().unwrap().advance(delta, Instant::now());
@@ -940,21 +957,34 @@ impl eframe::App for Dashboard {
                         self.command(preview::ClientCommand::Advance(delta));
                     }
                 }
-                changed |= ui
+                let mut auto_rotate =
+                    self.settings.agent_view.auto_rotate && !self.frame_view.rotation_paused;
+                if ui
                     .checkbox(
-                        &mut self.settings.agent_view.auto_rotate,
+                        &mut auto_rotate,
                         format!(
                             "每 {} 秒轮播",
                             self.settings.agent_view.rotate_interval_seconds
                         ),
                     )
-                    .changed();
+                    .changed()
+                {
+                    self.settings.agent_view.auto_rotate = auto_rotate;
+                    changed = true;
+                }
                 if ui.button("会话与来源状态").clicked() {
                     self.show_sessions = !self.show_sessions;
                 }
             });
             if changed {
+                let mut view = self.view.lock().unwrap().clone();
+                view.temporary_mode = None;
+                view.rotation_paused = false;
+                view.reset_timer(Instant::now());
+                *self.view.lock().unwrap() = view.clone();
                 self.save();
+                #[cfg(windows)]
+                self.command(preview::ClientCommand::View(view));
             }
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -972,16 +1002,16 @@ impl eframe::App for Dashboard {
                         .fit_to_exact_size(egui::vec2(width, width / 4.0))
                         .sense(egui::Sense::click()),
                 );
-                if response.clicked()
+                if !night
+                    && !system_off
+                    && response.clicked()
                     && let Some(pos) = response.interact_pointer_pos()
                 {
                     let x = (pos.x - response.rect.min.x) * 1920.0 / response.rect.width();
                     let y = (pos.y - response.rect.min.y) * 480.0 / response.rect.height();
                     let mut view = self.frame_view.clone();
                     if view.click(x, y, Instant::now()) {
-                        self.settings.agent_view = view.preferences.clone();
                         *self.view.lock().unwrap() = view.clone();
-                        self.save();
                         #[cfg(windows)]
                         self.command(preview::ClientCommand::View(view));
                     }
@@ -1329,6 +1359,37 @@ mod tests {
         ));
         // Reopening after releasing the texture must upload even an unchanged frame.
         assert!(Arc::ptr_eq(&output.preview_frame(None).unwrap(), &latest));
+    }
+
+    #[test]
+    fn display_frames_skip_rendering_when_blank_or_without_a_consumer() {
+        let black = Arc::new(image::RgbaImage::from_pixel(
+            2,
+            1,
+            image::Rgba([0, 0, 0, 255]),
+        ));
+        for connected in [false, true] {
+            for preview in [false, true] {
+                let frame = display_frame(true, connected, preview, &black, || {
+                    panic!("A blank display must bypass dashboard rendering")
+                })
+                .unwrap();
+                assert!(Arc::ptr_eq(&frame, &black));
+            }
+        }
+        assert!(
+            display_frame(false, false, false, &black, || {
+                panic!("An unused display must bypass dashboard rendering")
+            })
+            .is_none()
+        );
+        for (connected, preview) in [(true, false), (false, true), (true, true)] {
+            let frame = display_frame(false, connected, preview, &black, || {
+                image::RgbaImage::from_pixel(2, 1, image::Rgba([1, 2, 3, 255]))
+            })
+            .unwrap();
+            assert_eq!(frame.get_pixel(0, 0).0, [1, 2, 3, 255]);
+        }
     }
 
     #[test]

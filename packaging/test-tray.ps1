@@ -34,13 +34,39 @@ function Wait-InitialPreview {
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'Preview window was not created.'
 }
-function Start-Monitor([string]$prefix) {
+function Start-Monitor([string]$prefix, [switch]$Background) {
     $script:stderr = Join-Path $testRoot "$prefix-stderr.log"
-    Start-Process -FilePath $Executable -ArgumentList @('--demo', '--preview', '--config', ('"{0}"' -f $configPath)) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $testRoot "$prefix-stdout.log") -RedirectStandardError $stderr
+    $launchArguments = @('--demo', '--config', ('"{0}"' -f $configPath))
+    $launchArguments += if ($Background) { '--background' } else { '--preview' }
+    Start-Process -FilePath $Executable -ArgumentList $launchArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $testRoot "$prefix-stdout.log") -RedirectStandardError $stderr
 }
 
-$monitor = Start-Monitor 'hidden-quit'
+$unavailableSourceConfig = '{"agent_view":{"origin_filter":"wsl:offline:1000","mode":"overview","auto_rotate":true}}'
+[IO.File]::WriteAllText($configPath, $unavailableSourceConfig, [Text.UTF8Encoding]::new($false))
+$monitor = Start-Monitor 'background' -Background
 try {
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    do {
+        $monitor.Refresh()
+        if ($monitor.HasExited) { throw "Monitor exited during startup: $(Get-Content -LiteralPath $stderr -Raw)" }
+        $windows = & $driver -MonitorPid $monitor.Id -Action Inspect | ConvertFrom-Json
+        $trayWindow = $windows | Where-Object Class -eq 'tray_icon_app' | Select-Object -First 1
+        if ($trayWindow) { break }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (-not $trayWindow) { throw "Background startup did not create a tray icon: $(Get-Content -LiteralPath $stderr -Raw)" }
+    Start-Sleep -Seconds 4
+    $null = Assert-Window 'Inspect' $false
+    $null = Assert-Window 'Preview' $true
+    Start-Sleep -Seconds 2
+    if ([IO.File]::ReadAllText($configPath) -ne $unavailableSourceConfig) {
+        throw 'Opening the preview overwrote the unavailable source filter.'
+    }
+    $null = Assert-Window 'Close' $false
+    $null = Invoke-TrayAction 'Quit'
+    if (-not $monitor.WaitForExit(5000) -or $monitor.ExitCode -ne 0) { throw 'Background startup regression did not exit cleanly.' }
+    [IO.File]::WriteAllText($configPath, '{}', [Text.UTF8Encoding]::new($false))
+    $monitor = Start-Monitor 'hidden-quit'
     $null = Wait-InitialPreview
 
     $null = Assert-Window 'Close' $false

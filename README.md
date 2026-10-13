@@ -22,7 +22,7 @@
 cargo run --release
 ```
 
-应用显示预览，自动尝试连接 LCD。右上工具栏或托盘菜单可打开独立的原生设置窗口，可拖到预览外或另一块屏幕；再次打开会唤起已有设置窗口。关闭设置只关闭设置，关闭或隐藏预览时设置也一起关闭。关闭预览后留在系统托盘，双击托盘图标重新打开，托盘菜单或工具栏的「退出」停止程序。
+默认启动显示预览，`--background` 启动到托盘，两种方式都自动尝试连接 LCD。右上工具栏或托盘菜单可打开独立的原生设置窗口，可拖到预览外或另一块屏幕；再次打开会唤起已有设置窗口。关闭设置只关闭设置，关闭或隐藏预览时设置也一起关闭。关闭预览后留在系统托盘，双击托盘图标重新打开，托盘菜单或工具栏的「退出」停止程序。
 
 Windows 预览按需运行在独立进程中；关闭窗口会退出预览进程，释放窗口、纹理和显卡驱动缓存。后台继续采集、轮播和输出 LCD，并接收系统电源通知。打开预览期间会看到两个同名进程，查看内存时需合计两者。
 
@@ -31,7 +31,7 @@ Windows 预览按需运行在独立进程中；关闭窗口会退出预览进程
 ```powershell
 cargo run --release -- --preview       # 保持本机预览入口
 cargo run --release -- --demo          # 演示数据，仍可输出到 LCD
-cargo run --release -- --background    # 连接 LCD 后隐藏到托盘
+cargo run --release -- --background    # 启动到托盘
 cargo run --release -- --snapshot dashboard.png --cores 16
 cargo run --release -- --gif dashboard.gif --frames 48 --fps 12 --scale 2
 cargo run --release -- --benchmark 120  # 真实 USB 吞吐测试，先退出常驻实例
@@ -48,7 +48,7 @@ cargo run --release -- --diagnostics --diagnostics-seconds 35 # 观察持续采�
 # dist/win-thermalright-ai-monitor/win-thermalright-ai-monitor.exe
 ```
 
-便携包包含 `win-thermalright-ai-monitor.exe`、`README.md`、`LICENSE` 和 `THIRD_PARTY.md`。libusb、SQLite 和桌宠图片都内嵌到程序；字体默认读取 Windows 自带的微软雅黑，无需单独放 DLL 或素材目录。
+便携包包含 `win-thermalright-ai-monitor.exe`、`README.md`、`LICENSE` 和 `THIRD_PARTY.md`。libusb 和桌宠图片都内嵌到程序；字体默认读取 Windows 自带的微软雅黑，无需单独放 DLL 或素材目录。
 
 使用已编译的其他输出文件打包时，可传入 `packaging/build.ps1 -SkipBuild -ExecutablePath <exe路径>`。
 
@@ -71,16 +71,15 @@ USB 实现沿用参考项目的 2048 字节握手、496 字节 JPEG 数据块、
 |---|---|
 | CPU | 总占用率、逻辑核心横条、处理器名称、可选温度、随负载变化的皮卡丘；17–32 核用双列，更多核心按标注的索引范围分组取平均 |
 | AI 会话 | Windows 与运行中 WSL2 合并；六卡总览 / 双栏详情、来源和 Agent 筛选、分段分页器、8 秒轮播；同项目多个会话独立显示，奇数末页扩展为单栏 |
-| Token | 本地自然日的 In/Out；Claude 包含缓存创建与缓存读取，消息 ID 去重；Codex 用累计用量差值避免重复事件计数；Cursor 显示「—」 |
+| Token | 本地自然日的 In/Out；Claude 包含缓存创建与缓存读取，消息 ID 去重；Codex 用累计用量差值避免重复事件计数 |
 | Codex 额度 | 桌面会话展开信息保留该来源的额度日志读数；账户归属未知时不合并不同来源的额度 |
-| Cursor | 可从本地 SQLite 只读获取当前会话的上下文使用率和模型；没有对应表或数据时省略 |
 | 内存 | 占用率仪表、总量、已用/可用/页面文件横条；大号时钟、日期、开机时长、进程数 |
 
 Windows 不直接提供 macOS 的 Active/Wired/Compressed、P/E 核标签及 load average，因此核心标为 C1、C2 等，底部显示逻辑核心数，内存使用 Used/Available/Pagefile；Pagefile 横条表示已用量占页面文件总量的比例。CPU 温度缺失时显示「—」，不使用 ACPI thermal zone 冒充 CPU 温度。
 
 要显示温度，运行 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) 并启用其 WMI 提供程序；本应用只读查询 `ROOT\LibreHardwareMonitor` 的 CPU Temperature 传感器，也支持 OpenHardwareMonitor。传感器权限和支持情况取决于监控工具与主板。
 
-渲染与 USB 在后台线程执行，指标独立采集。活动动画时目标约 15 fps，空闲 2 fps；实际帧率受 CPU/JPEG 编码和 USB 限制。设置可启用跨午夜的夜间熄屏（默认关闭，预设 18:30–09:00），夜间 LCD 输出黑帧，本机继续预览。
+渲染与 USB 在后台线程执行，指标独立采集。活动动画时目标约 15 fps，空闲 2 fps；实际帧率受 CPU/JPEG 编码和 USB 限制。LCD 未连接且预览关闭时暂停画面渲染，后台继续采集和重连。设置可启用跨午夜的夜间熄屏（默认关闭，预设 18:30–09:00）。夜间或系统熄屏时暂停表盘渲染，LCD 和已打开的预览显示黑帧；亮屏后恢复实时画面。
 
 设置中的「跟随系统熄屏/亮屏」默认启用，可随时关闭。启用后 LCD 跟随 Windows 显示器电源状态：系统熄屏时输出黑帧，系统亮屏时恢复实时画面，隐藏到托盘后仍然生效。系统仅调暗屏幕时保持显示；如果仍处于启用的夜间熄屏时段，则继续保持黑屏。这里的熄屏与夜间模式相同，使用黑帧，不关闭 LCD 背光或切断 USB 电源。
 
@@ -92,15 +91,14 @@ Windows 不直接提供 macOS 的 Active/Wired/Compressed、P/E 核标签及 loa
 |---|---|
 | Claude | `%USERPROFILE%\.claude\sessions\<pid>.json` 与 `projects\*\*.jsonl` |
 | Codex | `%USERPROFILE%\.codex\sessions\**\*.jsonl` |
-| Cursor | `%USERPROFILE%\.cursor\projects\*\agent-transcripts\**\*.jsonl` |
-| Cursor 上下文 | `%APPDATA%\Cursor\User\globalStorage\state.vscdb` |
-| Cursor 模型 | `%USERPROFILE%\.cursor\ai-tracking\ai-code-tracking.db` |
 
 会话是否打开由运行实例证明：Windows Codex 查询已确认进程持有的 rollout 文件；WSL2 在发行版内读取 `/proc`、进程启动时间和启动纪元。Claude 读取原生 `sessions/<pid>.json`，独立校验进程所属用户、PID 与启动标识，再按 `sessionId` 校验对应日志。仅有历史日志不会进入打开列表，无法关联的进程和过期证据显示“待确认”。Codex 的 Guardian / 子 Agent 不进入主会话列表，用量仍计入汇总。
 
-Codex 共享 `app-server` 可同时持有多个主会话：每份校验过文件身份和元数据的 rollout 独立建卡。更新守护进程不进入列表；Windows 和 WSL2 通过 Unix socket 对端身份排除连接到已关联服务的重复 CLI 前端。Windows 只排除没有自持 rollout 的前端，并再次校验双方进程启动标识；验证失败时仍保留待确认项。普通 CLI 的多个主会话候选继续显示歧义，不按项目目录或修改时间猜测。已关联会话首次读取日志优先于历史用量回填。
+Codex 共享 `app-server` 可同时持有多个主会话：每份校验过文件身份和元数据的 rollout 独立建卡。空闲服务完成身份与句柄检查后，未持有会话日志时不生成会话卡片。更新守护进程不进入列表；Windows 和 WSL2 通过 Unix socket 对端身份排除连接到已关联服务的重复 CLI 前端。Windows 只排除没有自持 rollout 的前端，并再次校验双方进程启动标识；验证失败时仍保留待确认项。普通 CLI 的多个主会话候选继续显示歧义，不按项目目录或修改时间猜测。已关联会话首次读取日志优先于历史用量回填。
 
-JSONL 只消费完整行，按文件身份维护偏移，处理替换、截断和本地午夜重算。活跃实例关联的旧日志不受最近 8 个日志回退限制。今日用量按 Windows 本地日期汇总并按事件身份去重，包含已关闭会话；筛选和切页不改变统计。缺失来源、坏记录和未完成回填会标记“部分来源 / 正在补齐”。缺少稳定事件身份的导入或 fork，跨来源去重仍有覆盖限制。
+JSONL 只消费完整行，按文件身份维护偏移，处理替换、截断和本地午夜重算。读取今日日志及活跃实例关联的日志，跨日运行的实例仍可读取旧日志。今日用量按 Windows 本地日期汇总并按事件身份去重，包含已关闭会话；筛选和切页不改变统计。缺失来源、坏记录和未完成回填会标记“部分来源 / 正在补齐”。缺少稳定事件身份的导入或 fork，跨来源去重仍有覆盖限制。
+
+Windows 单条日志支持最多 16 MiB，显示文本按界面长度截取，事件身份和 Token 数值完整解析。超限记录标记为采集错误并分段跳过，后续记录继续采集；统计保留“部分来源”标记。正常记录等待完整换行后才推进读取位置。
 
 WSL2 的最新会话事件与今日用量分别读取，工作状态不等待历史回填。大记录只缩短传输的显示文本，读取位置仍按原文件字节推进；事件身份和数值用量保留。首次回填期间加快采集，完成后恢复常规间隔。没有当天日志且没有运行会话的来源显示“无可监控会话”，不回放旧历史。
 
@@ -145,7 +143,7 @@ WSL2 默认探测运行中的发行版和默认用户，额外用户可在 `agen
 
 ## 多会话与原生会话登记
 
-首次运行自动推荐布局：1–2 个已确认打开的会话用详情，3 个及以上用总览。选择手动模式后保存偏好；没有固定会话或左右绑定。预览点击总览卡片进入对应详情页，点击分页器暂停轮播。托盘隐藏时继续轮播，夜间或系统熄屏时暂停，亮屏后重新计时。
+首次运行自动推荐布局：1–2 个已确认打开的会话用详情，3 个及以上用总览。工具栏中选择布局、筛选和轮播会保存为偏好。点击总览卡片进入详情、点击分页器暂停轮播只影响当前运行，下次启动恢复保存的偏好。来源暂不可用时保留所选筛选，来源恢复后继续显示对应会话。托盘隐藏时继续轮播，夜间或系统熄屏时暂停，亮屏后重新计时。
 
 Claude 通过 CLI 自带的原生登记关联 Windows / WSL 会话，监控程序只读采集。需要 CLI 提供 `sessions/<pid>.json` 中的 `pid`、`sessionId` 和 `procStart`；Windows 启动标识使用 FILETIME，Linux 使用 `/proc/<pid>/stat` 的启动 tick。登记缺失、身份冲突或日志身份无法校验时显示待确认，不按项目目录猜测。
 

@@ -381,16 +381,6 @@ impl Monitor {
             }
             .into(),
         };
-        self.merger.snapshot.origins_ready = self
-            .jobs
-            .iter()
-            .all(|j| self.origin_ids.contains_key(&j.id))
-            && !self
-                .merger
-                .snapshot
-                .origins
-                .iter()
-                .any(|o| o.origin_id == "wsl-discovery");
         self.merger.snapshot.clone()
     }
     pub fn collect_once(&mut self, stop: &AtomicBool) -> AgentSnapshot {

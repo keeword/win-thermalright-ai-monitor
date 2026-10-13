@@ -414,9 +414,49 @@ mod tests {
         assert!(view.click(1200.0, 260.0, now)); // global index 5, detail page 2
         assert_eq!(view.page, 2);
         assert_eq!(view.mode, ViewMode::Details);
-        assert!(!view.preferences.auto_rotate);
+        assert!(view.rotation_paused);
+        assert_eq!(view.preferences, prefs);
+        view.sync(&snapshot(9), &prefs, now + Duration::from_secs(60), false);
+        assert_eq!(view.page, 2);
+        assert_eq!(view.mode, ViewMode::Details);
+        assert_eq!(view.preferences, prefs);
         assert!(view.click(420.0, 390.0, now));
         assert_eq!(view.page, 0);
+
+        let saved: ViewPreferences =
+            serde_json::from_str(&serde_json::to_string(&view.preferences).unwrap()).unwrap();
+        let mut restarted = ViewState::default();
+        restarted.sync(&snapshot(9), &saved, now, false);
+        assert_eq!(restarted.mode, ViewMode::Overview);
+        assert!(!restarted.rotation_paused);
+        restarted.sync(&snapshot(9), &saved, now + Duration::from_secs(8), false);
+        assert_eq!(restarted.page, 1);
+
+        let explicit = ViewPreferences {
+            mode: ViewMode::Details,
+            ..prefs
+        };
+        view.sync(&snapshot(9), &explicit, now, false);
+        assert!(view.temporary_mode.is_none());
+        assert!(!view.rotation_paused);
+    }
+
+    #[test]
+    fn unavailable_origin_filter_recovers_without_changing_preferences() {
+        let prefs = ViewPreferences {
+            origin_filter: "windows".into(),
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let mut view = ViewState::default();
+        view.sync(&snapshot(3), &prefs, now, false);
+        assert_eq!(view.keys.len(), 3);
+        view.sync(&AgentSnapshot::default(), &prefs, now, false);
+        assert!(view.keys.is_empty());
+        assert_eq!(view.preferences, prefs);
+        view.sync(&snapshot(3), &prefs, now, false);
+        assert_eq!(view.keys.len(), 3);
+        assert_eq!(view.preferences, prefs);
     }
     #[test]
     fn rotation_pauses_during_blank_and_does_not_catch_up_after_wake() {
@@ -667,7 +707,6 @@ pub struct AgentSnapshot {
     pub instances: Vec<LiveInstance>,
     pub origins: Vec<Origin>,
     pub daily_usage: DailyUsage,
-    pub origins_ready: bool,
 }
 impl AgentSnapshot {
     pub fn short_id(&self, key: &SessionKey) -> String {
@@ -719,6 +758,8 @@ impl Default for ViewPreferences {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ViewState {
     pub preferences: ViewPreferences,
+    pub temporary_mode: Option<ViewMode>,
+    pub rotation_paused: bool,
     pub mode: ViewMode,
     pub page: usize,
     pub keys: Vec<SessionKey>,
@@ -730,6 +771,8 @@ impl Default for ViewState {
     fn default() -> Self {
         Self {
             preferences: ViewPreferences::default(),
+            temporary_mode: None,
+            rotation_paused: false,
             mode: ViewMode::Details,
             page: 0,
             keys: vec![],
@@ -762,8 +805,12 @@ impl ViewState {
     ) {
         let changed = self.preferences != *preferences;
         let anchor = self.keys.get(self.page * self.page_size()).cloned();
+        if changed {
+            self.temporary_mode = None;
+            self.rotation_paused = false;
+        }
         self.preferences = preferences.clone();
-        self.mode = match preferences.mode {
+        self.mode = match self.temporary_mode.unwrap_or(preferences.mode) {
             ViewMode::Auto => {
                 if snapshot
                     .sessions
@@ -809,7 +856,12 @@ impl ViewState {
             self.reset_timer(now);
         }
         self.paused = blank;
-        if !blank && preferences.auto_rotate && self.pages() > 1 && now >= self.next_rotate {
+        if !blank
+            && preferences.auto_rotate
+            && !self.rotation_paused
+            && self.pages() > 1
+            && now >= self.next_rotate
+        {
             self.advance(1, now);
         }
     }
@@ -828,7 +880,7 @@ impl ViewState {
         if (378.0..406.0).contains(&y) && self.pages() > 1 {
             self.page = (((x - 416.0).max(0.0) / 1110.0) * self.pages() as f32) as usize;
             self.page = self.page.min(self.pages() - 1);
-            self.preferences.auto_rotate = false;
+            self.rotation_paused = true;
             self.reset_timer(now);
             return true;
         }
@@ -845,8 +897,8 @@ impl ViewState {
                 && index < self.keys.len()
             {
                 self.mode = ViewMode::Details;
-                self.preferences.mode = ViewMode::Details;
-                self.preferences.auto_rotate = false;
+                self.temporary_mode = Some(ViewMode::Details);
+                self.rotation_paused = true;
                 self.page = index / 2;
                 self.reset_timer(now);
                 return true;

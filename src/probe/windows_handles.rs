@@ -68,6 +68,7 @@ pub struct HeldRollout {
 #[derive(Default)]
 pub struct CodexHandles {
     pub rollouts: Vec<HeldRollout>,
+    pub has_rollout: bool,
     pub unix_peer_pids: HashSet<u32>,
 }
 
@@ -174,6 +175,7 @@ pub fn codex_handles(pid: u32, started: u64) -> Result<CodexHandles> {
         if !name.ends_with(".jsonl") || !name.contains("rollout-") {
             continue;
         }
+        result.has_rollout = true;
         let path = PathBuf::from(name);
         if let Ok(file) = std::fs::File::open(&path) {
             use std::os::windows::io::AsRawHandle;
@@ -285,6 +287,7 @@ mod tests {
         let pid = std::process::id();
         let started = process_time(pid).unwrap();
         let found = codex_handles(pid, started).unwrap();
+        assert!(found.has_rollout);
         assert!(found.unix_peer_pids.contains(&pid));
         assert!(found.rollouts.iter().any(|held| {
             held.metadata
@@ -297,5 +300,18 @@ mod tests {
         let mut byte = 0u8;
         assert_eq!(unsafe { recv(accepted.0, &mut byte, 1, 0) }, 1);
         assert_eq!(byte, b'x');
+        drop(rollout);
+        let idle = codex_handles(pid, started).unwrap();
+        assert!(!idle.has_rollout);
+        assert!(idle.rollouts.is_empty());
+        use std::os::windows::fs::OpenOptionsExt;
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&rollout_path)
+            .unwrap();
+        let unreadable = codex_handles(pid, started).unwrap();
+        assert!(unreadable.has_rollout);
+        assert!(unreadable.rollouts.is_empty());
     }
 }

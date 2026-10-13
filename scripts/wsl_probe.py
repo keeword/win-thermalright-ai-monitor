@@ -257,8 +257,7 @@ def probe(request):
             except (OSError, ValueError) as error:
                 fail(error)
         roots = {(os.path.join(os.environ.get("CODEX_HOME", os.path.join(home, ".codex")), "sessions"), "Codex"),
-                 (os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(home, ".claude")), "projects"), "Claude"),
-                 (os.path.join(home, ".cursor/projects"), "Cursor")}
+                 (os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(home, ".claude")), "projects"), "Claude")}
         for pid, (kind, parent, started) in processes.items():
             if pid in launchers and any(p == pid and k == kind for k, p, _ in processes.values()):
                 continue  # actual CLI child owns this invocation
@@ -266,6 +265,7 @@ def probe(request):
             matches = {}
             error = None
             auxiliary = False
+            has_rollout = False
             sockets[pid] = set()
             native_work_state = None
             env = {}
@@ -286,6 +286,7 @@ def probe(request):
                                 continue
                             if not os.path.basename(path).startswith("rollout-") or not path.endswith(".jsonl"):
                                 continue
+                            has_rollout = True
                             # Independently open; never read through the process's fd.
                             with open(path, "rb") as stream:
                                 held = os.stat(fd)
@@ -341,6 +342,8 @@ def probe(request):
             if current_identity != started:
                 fail("process identity changed: " + str(pid))
                 continue
+            if roles[pid] == "server" and not has_rollout and error is None:
+                continue
             # New Codex versions share a server across several CLI clients.
             # Every held, identity-checked main rollout is a separate session.
             shared = sorted(matches) if roles[pid] == "server" else []
@@ -377,8 +380,6 @@ def probe(request):
                     path = os.path.join(directory, name)
                     relative = os.path.relpath(path, root)
                     if kind == "Claude" and len(relative.split(os.sep)) != 2:
-                        continue
-                    if kind == "Cursor" and "agent-transcripts" not in relative.split(os.sep):
                         continue
                     try:
                         modified = os.stat(path).st_mtime

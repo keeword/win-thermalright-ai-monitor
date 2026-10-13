@@ -52,8 +52,15 @@ impl Settings {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let settings: Self = serde_json::from_slice(&std::fs::read(&path)?)
+        let mut settings: Self = serde_json::from_slice(&std::fs::read(&path)?)
             .with_context(|| format!("Invalid settings: {}", path.display()))?;
+        if settings
+            .agent_view
+            .agent_filter
+            .eq_ignore_ascii_case("cursor")
+        {
+            settings.agent_view.agent_filter = "all".into();
+        }
         anyhow::ensure!(
             (1..=10).contains(&settings.brightness),
             "brightness must be 1..10"
@@ -302,4 +309,15 @@ fn legacy_settings_migrate_without_session_binding_fields() {
     assert!(!settings.follow_system_display);
     assert_eq!(settings.agent_view.mode, crate::session::ViewMode::Auto);
     assert!(settings.agents.windows_enabled && settings.agents.wsl_running_enabled);
+}
+
+#[test]
+fn removed_agent_filter_loads_as_all() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("settings.json");
+    std::fs::write(&path, r#"{"agent_view":{"agent_filter":"Cursor"}}"#).unwrap();
+    assert_eq!(
+        Settings::load(Some(&path)).unwrap().agent_view.agent_filter,
+        "all"
+    );
 }

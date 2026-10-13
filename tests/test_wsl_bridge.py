@@ -147,6 +147,40 @@ class GuestTests(unittest.TestCase):
             self.assertIsNone(ambiguous["instances"][0]["session_key"])
             self.assertEqual(ambiguous["instances"][0]["shared_session_keys"], [])
 
+    def test_idle_shared_server_does_not_create_an_unlinked_session(self):
+        rows = {100: {"argv": ["codex", "app-server", "--managed-daemon"], "fds": ["socket:[400]"]},
+                101: {"fds": []}}
+        with self.processes(rows):
+            result = guest.probe({"registration": "distro", "day_start": 0})
+        self.assertTrue(result["complete"])
+        self.assertEqual([i["instance_key"]["pid"] for i in result["instances"]], [101])
+        self.assertIsNone(result["instances"][0]["session_key"])
+
+    def test_shared_server_with_unreadable_or_invalid_evidence_stays_unlinked(self):
+        rows = {100: {"argv": ["codex", "app-server", "--managed-daemon"]}}
+        with self.processes(rows):
+            actual_open = open
+            def opened(name, *args, **kwargs):
+                if name == "/proc/100/environ":
+                    raise PermissionError("environment denied")
+                return actual_open(name, *args, **kwargs)
+            with patch("builtins.open", side_effect=opened):
+                result = guest.probe({"registration": "distro", "day_start": 0})
+        self.assertFalse(result["complete"])
+        self.assertEqual(len(result["instances"]), 1)
+        self.assertIn("environment denied", result["instances"][0]["error"])
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / "rollout-unconfirmed.jsonl"
+            rows[100]["fds"] = [path]
+            for data in ["", "{bad\n", '{"type":"session_meta","payload":{}}\n']:
+                with self.subTest(data=data):
+                    path.write_text(data)
+                    with self.processes(rows):
+                        result = guest.probe({"registration": "distro", "day_start": 0})
+                    self.assertEqual(len(result["instances"]), 1)
+                    self.assertIsNone(result["instances"][0]["session_key"])
+
     def test_reused_pid_cannot_associate_the_previous_process_rollout(self):
         with tempfile.TemporaryDirectory() as folder:
             path = pathlib.Path(folder) / "rollout-main.jsonl"

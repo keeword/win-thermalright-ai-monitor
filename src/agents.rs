@@ -9,19 +9,19 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AgentKind {
     Claude,
     Codex,
-    Cursor,
 }
 impl AgentKind {
-    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Cursor];
+    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
     pub fn name(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
             Self::Codex => "Codex",
-            Self::Cursor => "Cursor",
         }
     }
 }
@@ -52,7 +52,6 @@ pub struct Usage {
     pub plan: Option<Plan>,
     pub quota_used: Option<f64>,
     pub quota_reset: Option<i64>,
-    pub context_used: Option<f64>,
     pub session_id: String,
     pub log_path: Option<PathBuf>,
     pub last_activity: Option<DateTime<Utc>>,
@@ -61,6 +60,7 @@ pub struct Usage {
 #[derive(Default)]
 struct Session {
     offset: u64,
+    skipping_record: bool,
     modified: Option<SystemTime>,
     usage: Usage,
     session_id: String,
@@ -119,40 +119,35 @@ impl Collector {
                 std::env::var_os("CODEX_HOME")
                     .map(PathBuf::from)
                     .map(|p| p.join("sessions"))
-            } else if kind == AgentKind::Claude {
+            } else {
                 std::env::var_os("CLAUDE_CONFIG_DIR")
                     .map(PathBuf::from)
                     .map(|p| p.join("projects"))
-            } else {
-                None
             }
             .unwrap_or_else(|| {
                 self.home.join(match kind {
                     AgentKind::Claude => ".claude/projects",
                     AgentKind::Codex => ".codex/sessions",
-                    AgentKind::Cursor => ".cursor/projects",
                 })
             });
             let mut files = Vec::new();
             let root = root.canonicalize().unwrap_or(root);
             let mut roots = vec![root.clone()];
-            if matches!(kind, AgentKind::Codex | AgentKind::Claude) {
-                for (_, path) in required.iter().filter(|(k, _)| *k == kind) {
-                    if let Some(log_root) = path.ancestors().find(|p| {
-                        p.file_name().is_some_and(|n| {
-                            n == if kind == AgentKind::Claude {
-                                "projects"
-                            } else {
-                                "sessions"
-                            }
-                        })
-                    }) {
-                        let log_root = log_root
-                            .canonicalize()
-                            .unwrap_or_else(|_| log_root.to_path_buf());
-                        if !roots.contains(&log_root) {
-                            roots.push(log_root);
+            for (_, path) in required.iter().filter(|(k, _)| *k == kind) {
+                if let Some(log_root) = path.ancestors().find(|p| {
+                    p.file_name().is_some_and(|n| {
+                        n == if kind == AgentKind::Claude {
+                            "projects"
+                        } else {
+                            "sessions"
                         }
+                    })
+                }) {
+                    let log_root = log_root
+                        .canonicalize()
+                        .unwrap_or_else(|_| log_root.to_path_buf());
+                    if !roots.contains(&log_root) {
+                        roots.push(log_root);
                     }
                 }
             }
@@ -177,13 +172,6 @@ impl Collector {
                     }
                     let relative = path.strip_prefix(&scan_root).unwrap_or(path);
                     if kind == AgentKind::Claude && relative.components().count() != 2 {
-                        continue;
-                    }
-                    if kind == AgentKind::Cursor
-                        && !relative
-                            .components()
-                            .any(|c| c.as_os_str() == "agent-transcripts")
-                    {
                         continue;
                     }
                     let metadata = match entry.metadata() {
@@ -230,11 +218,9 @@ impl Collector {
                     std::cmp::Reverse(*activity),
                 )
             });
-            // Read today's active logs plus recent fallback sessions. Activity
-            // comes from the transcript on Codex, not NTFS write timestamps.
-            for (index, (path, size, modified, activity)) in files.into_iter().enumerate() {
-                if index >= 8
-                    && DateTime::<Local>::from(activity).date_naive() < self.day
+            // Identified live sessions remain readable across midnight.
+            for (path, size, modified, activity) in files {
+                if DateTime::<Local>::from(activity).date_naive() < self.day
                     && !required.iter().any(|(_, p)| p == &path)
                 {
                     continue;
@@ -316,9 +302,6 @@ impl Collector {
                     usage.available = true;
                     usage.input = session.tokens.values().map(|v| v.0).sum();
                     usage.output = session.tokens.values().map(|v| v.1).sum();
-                    if kind == AgentKind::Cursor {
-                        cursor_details(&self.home, &sid, &mut usage);
-                    }
                     result.sessions.push((kind, usage));
                 }
             }
@@ -553,16 +536,30 @@ fn read_new_limited(
     // Limit one pass so a large initial transcript cannot pin the collector forever.
     let mut consumed = 0;
     while consumed < limit {
+        if session.skipping_record {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                break;
+            }
+            let chunk = &buffer[..buffer.len().min(limit - consumed)];
+            let newline = chunk.iter().position(|byte| *byte == b'\n');
+            let n = newline.map_or(chunk.len(), |index| index + 1);
+            session.skipping_record = newline.is_none();
+            reader.consume(n);
+            session.offset += n as u64;
+            consumed += n;
+            continue;
+        }
         line.clear();
         let n = (&mut reader)
-            .take(1024 * 1024 + 1)
+            .take((MAX_RECORD_BYTES + 1) as u64)
             .read_until(b'\n', &mut line)?;
-        if n > 1024 * 1024 {
-            session.parse_error = Some("JSONL record exceeds 1 MiB".into());
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "JSONL record exceeds 1 MiB",
-            ));
+        if n > MAX_RECORD_BYTES {
+            session.parse_error = Some("JSONL record exceeds 16 MiB".into());
+            session.skipping_record = line.last() != Some(&b'\n');
+            session.offset += n as u64;
+            consumed += n;
+            continue;
         }
         if n == 0 || line.last() != Some(&b'\n') {
             break;
@@ -853,36 +850,6 @@ fn apply(session: &mut Session, kind: AgentKind, v: &Value, day: NaiveDate) {
     }
 }
 
-fn cursor_details(home: &Path, sid: &str, usage: &mut Usage) {
-    use rusqlite::{Connection, OpenFlags};
-    let appdata = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join("AppData/Roaming"));
-    let path = appdata.join("Cursor/User/globalStorage/state.vscdb");
-    if let Ok(db) = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        let _ = db.busy_timeout(Duration::from_millis(50));
-        if let Ok(mut query) =
-            db.prepare("SELECT value FROM composerHeaders WHERE composerId = ?1 LIMIT 1")
-            && let Ok(value) = query.query_row([sid], |r| r.get::<_, String>(0))
-            && let Ok(v) = serde_json::from_str::<Value>(&value)
-        {
-            usage.context_used = v["contextUsagePercent"].as_f64();
-        }
-    }
-    if usage.model.is_empty()
-        && let Ok(db) = Connection::open_with_flags(
-            home.join(".cursor/ai-tracking/ai-code-tracking.db"),
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-    {
-        let _ = db.busy_timeout(Duration::from_millis(50));
-        if let Ok(model)=db.query_row("SELECT model FROM ai_code_hashes WHERE conversationId = ?1 AND model IS NOT NULL ORDER BY timestamp DESC LIMIT 1",[sid],|r| r.get::<_,String>(0)) {usage.model=model;}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1138,6 +1105,32 @@ mod tests {
     }
 
     #[test]
+    fn old_logs_are_only_read_for_identified_live_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let old = root.join("old.jsonl");
+        write_codex_log(
+            &old,
+            "old-live",
+            "C:/project",
+            serde_json::json!("cli"),
+            Utc::now() - chrono::Duration::days(30),
+            "old message",
+        );
+        let mut collector = Collector::new(home.path().into());
+        let logs = collector.collect_logs(&[]);
+        assert!(logs.sessions.is_empty());
+        assert!(logs.events.is_empty());
+        assert!(!logs.backfilling);
+        let logs = collector.collect_logs(&[(AgentKind::Codex, old)]);
+        assert_eq!(logs.sessions.len(), 1);
+        assert_eq!(logs.sessions[0].1.session_id, "old-live");
+        assert!(logs.events.is_empty());
+        assert!(collector.collect_logs(&[]).sessions.is_empty());
+    }
+
+    #[test]
     fn remote_offsets_replacement_half_line_and_local_midnight_reset() {
         let home = tempfile::tempdir().unwrap();
         let mut collector = Collector::new(home.path().into());
@@ -1298,6 +1291,85 @@ mod tests {
         read_new(file.path(), &mut s, AgentKind::Claude, day).unwrap();
         assert_eq!(s.tokens.len(), 1);
     }
+    #[test]
+    fn large_local_records_preserve_display_usage_and_physical_cursor() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        let day = Local::now().date_naive();
+        let now = Utc::now();
+        writeln!(
+            file,
+            "{}",
+            json!({"timestamp":now,"type":"session_meta","payload":{"id":"large"}})
+        )
+        .unwrap();
+        writeln!(file, "{}", json!({"timestamp":now,"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"大".repeat(500_000)}]}})).unwrap();
+        writeln!(file, "{}", json!({"timestamp":now,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1234,"output_tokens":56}}}})).unwrap();
+        let mut session = Session::default();
+        read_new(file.path(), &mut session, AgentKind::Codex, day).unwrap();
+        assert!(session.parse_error.is_none());
+        assert_eq!(session.offset, file.as_file().metadata().unwrap().len());
+        assert_eq!(session.usage.message.chars().count(), 1600);
+        assert!(session.usage.waiting);
+        assert_eq!(
+            session.tokens.values().copied().collect::<Vec<_>>(),
+            [(1234, 56)]
+        );
+        read_new(file.path(), &mut session, AgentKind::Codex, day).unwrap();
+        assert_eq!(session.tokens.len(), 1);
+    }
+
+    #[test]
+    fn incomplete_large_records_wait_for_the_newline() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let day = Local::now().date_naive();
+        let record = json!({"timestamp":Utc::now(),"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(2 * 1024 * 1024)}]}});
+        write!(file, "{record}").unwrap();
+        let mut session = Session::default();
+        read_new(file.path(), &mut session, AgentKind::Codex, day).unwrap();
+        assert_eq!(session.offset, 0);
+        assert!(session.parse_error.is_none());
+        assert!(session.usage.message.is_empty());
+        writeln!(file).unwrap();
+        read_new(file.path(), &mut session, AgentKind::Codex, day).unwrap();
+        assert_eq!(session.offset, file.as_file().metadata().unwrap().len());
+        assert_eq!(session.usage.message.len(), 1600);
+    }
+
+    #[test]
+    fn over_limit_records_advance_in_bounded_passes_and_keep_later_usage() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&vec![b'x'; 16 * 1024 * 1024 + 4096])
+            .unwrap();
+        let day = Local::now().date_naive();
+        let mut session = Session::default();
+        read_new_limited(file.path(), &mut session, AgentKind::Codex, day, 1024).unwrap();
+        let offset = session.offset;
+        assert!(offset > 0);
+        assert!(
+            session
+                .parse_error
+                .as_ref()
+                .unwrap()
+                .contains("exceeds 16 MiB")
+        );
+        read_new_limited(file.path(), &mut session, AgentKind::Codex, day, 128).unwrap();
+        assert_eq!(session.offset, offset + 128);
+        writeln!(file).unwrap();
+        writeln!(file, "{}", json!({"timestamp":Utc::now(),"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20}}}})).unwrap();
+        read_new(file.path(), &mut session, AgentKind::Codex, day).unwrap();
+        assert_eq!(session.offset, file.as_file().metadata().unwrap().len());
+        assert_eq!(
+            session.tokens.values().copied().collect::<Vec<_>>(),
+            [(100, 20)]
+        );
+        assert!(session.parse_error.is_some());
+        read_new(file.path(), &mut session, AgentKind::Codex, day).unwrap();
+        assert_eq!(session.tokens.len(), 1);
+    }
+
     #[test]
     fn forks_keep_event_identity_and_truncation_clears_events() {
         let home = tempfile::tempdir().unwrap();
